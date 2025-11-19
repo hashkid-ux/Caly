@@ -41,8 +41,8 @@ export class WebRTCClient {
   private audioChunks: Blob[] = [];
   private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   private speechDetectionTimeout: ReturnType<typeof setTimeout> | null = null;
-  private SILENCE_THRESHOLD_MS = 600; // 600ms silence = sentence complete (natural pause)
-  private INITIAL_SPEECH_DELAY_MS = 200; // 200ms before checking for silence (quick response)
+  private SILENCE_THRESHOLD_MS = 350; // PRODUCTION: Faster response (350ms not 600ms)
+  private INITIAL_SPEECH_DELAY_MS = 150; // PRODUCTION: Quick detection (150ms not 200ms)
   private isSpeaking = false;
   private lastAudioTime = 0;
   private isProcessingSentence = false; // Prevent duplicate processing

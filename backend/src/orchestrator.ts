@@ -8,9 +8,19 @@ export class StreamingOrchestrator {
   private transcriptionBuffer: string = '';
   private responseBuffer: string = '';
   private isProcessing = false;
+  private currentRequestId: string = ''; // PRODUCTION: Request tracking
+  private readonly HINDI_SENTENCE_ENDINGS = ['।', '?', '!']; // PRODUCTION: Hindi sentence ends
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
+  }
+
+  /**
+   * PRODUCTION: Smart Hindi sentence detection
+   */
+  private isSentenceComplete(text: string): boolean {
+    if (text.length < 3) return false;
+    return this.HINDI_SENTENCE_ENDINGS.some(ending => text.trim().endsWith(ending));
   }
 
   /**
@@ -32,14 +42,21 @@ export class StreamingOrchestrator {
 
     // Prevent duplicate processing
     if (this.isProcessing) {
-      console.log(`[${this.sessionId}] ⚠️ Already processing, skipping duplicate request`);
+      console.log(`[${this.sessionId}] ⚠️ Already processing`);
+      return;
+    }
+
+    // PRODUCTION: Validate complete Hindi sentence
+    if (!this.isSentenceComplete(result.text)) {
+      console.log(`[${this.sessionId}] ⏳ Waiting for complete sentence...`);
       return;
     }
 
     this.isProcessing = true;
+    this.currentRequestId = `req_${Date.now()}`;
     this.transcriptionBuffer = result.text;
 
-    console.log(`[${this.sessionId}] ✅ Final transcription received: "${this.transcriptionBuffer}"`);
+    console.log(`[${this.sessionId}] ✅ Final: "${this.transcriptionBuffer}" [${this.currentRequestId}]`);
 
     try {
       await this.generateAndStreamResponse(
@@ -77,7 +94,7 @@ export class StreamingOrchestrator {
     let fullResponse = '';
     let tokenBuffer = '';
     let audioSent = false;
-    const minTokensForTTS = 5; // Synthesize after accumulating ~5 tokens or punctuation
+    const minTokensForTTS = 2; // PRODUCTION: Start TTS faster (2 tokens not 5)
 
     console.log(`[${this.sessionId}] 🚀 Starting LLM stream for: "${userInput}"`);
 
