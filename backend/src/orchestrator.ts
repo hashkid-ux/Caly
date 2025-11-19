@@ -1,5 +1,6 @@
 import { llmService } from './services/llm';
 import { ttsService } from './services/tts';
+import { asrService } from './services/asr';
 import { latencyTracker } from './utils/latencyTracker';
 import { LLMStreamToken, TranscriptionResult, AudioFragment } from './types';
 
@@ -16,11 +17,29 @@ export class StreamingOrchestrator {
   }
 
   /**
+   * REAL FIX: Transcribe audio buffer to text using AssemblyAI
+   */
+  async transcribeAudio(
+    audioBuffer: Buffer,
+    onResult: (result: TranscriptionResult) => void
+  ): Promise<void> {
+    try {
+      console.log(`[${this.sessionId}] 🔊 Starting transcription... (${audioBuffer.length} bytes)`);
+      await asrService.transcribeBuffer(audioBuffer, onResult);
+    } catch (error) {
+      console.error(`[${this.sessionId}] ❌ Transcription error:`, error);
+      throw error;
+    }
+  }
+
+  /**
    * PRODUCTION: Smart Hindi sentence detection
+   * Now more flexible - accept any non-empty transcription
    */
   private isSentenceComplete(text: string): boolean {
-    if (text.length < 3) return false;
-    return this.HINDI_SENTENCE_ENDINGS.some(ending => text.trim().endsWith(ending));
+    const trimmed = text.trim();
+    // Accept any meaningful text (3+ chars) - Hindi punctuation optional
+    return trimmed.length >= 3;
   }
 
   /**
@@ -46,9 +65,9 @@ export class StreamingOrchestrator {
       return;
     }
 
-    // PRODUCTION: Validate complete Hindi sentence
+    // PRODUCTION: Validate we have meaningful text (3+ chars is enough for Hindi/English)
     if (!this.isSentenceComplete(result.text)) {
-      console.log(`[${this.sessionId}] ⏳ Waiting for complete sentence...`);
+      console.log(`[${this.sessionId}] ⏳ Waiting for meaningful input (text too short)...`);
       return;
     }
 

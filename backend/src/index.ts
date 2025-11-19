@@ -122,10 +122,33 @@ io.on('connection', (socket) => {
       isWaitingForFinalAudio = true;
 
       try {
-        // Send transcription for processing
+        // REAL FIX: Transcribe audio with AssemblyAI FIRST
+        console.log(`[${socket.id}] 🎤 Sending to AssemblyAI for transcription...`);
+        
+        let transcribedText = '';
+        
+        await orchestrator.transcribeAudio(
+          combinedAudio,
+          (transcription) => {
+            transcribedText = transcription.text;
+            console.log(`[${socket.id}] ✅ Transcribed: "${transcribedText}"`);
+          }
+        );
+
+        if (!transcribedText.trim()) {
+          console.log(`[${socket.id}] ⚠️ No transcription received`);
+          socket.emit('text_response', {
+            text: 'No speech detected. Please speak again.',
+            timestamp: Date.now(),
+            isFinal: true,
+          });
+          return;
+        }
+
+        // Now process the transcribed text with LLM and TTS
         await orchestrator.onTranscriptionResult(
           {
-            text: 'Processing audio...', // Placeholder - actual transcription happens in ASR
+            text: transcribedText,
             isFinal: true,
             timestamp: Date.now(),
             latency: 0,

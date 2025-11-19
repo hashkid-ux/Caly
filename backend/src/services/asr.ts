@@ -38,6 +38,32 @@ export class ASRService {
     }
   }
 
+  /**
+   * REAL FIX: Transcribe audio buffer directly (NEW METHOD)
+   */
+  async transcribeBuffer(
+    audioBuffer: Buffer,
+    onTranscription: (result: TranscriptionResult) => void
+  ): Promise<void> {
+    try {
+      if (!this.apiKey) {
+        throw new Error('AssemblyAI API key not set. Get free key at https://www.assemblyai.com/');
+      }
+
+      console.log(`[ASR] Uploading ${audioBuffer.length} bytes...`);
+      const uploadUrl = await this.uploadAudio(audioBuffer);
+      
+      console.log(`[ASR] Requesting transcription...`);
+      const transcriptId = await this.requestTranscription(uploadUrl);
+      
+      console.log(`[ASR] Polling for results...`);
+      await this.pollTranscription(transcriptId, onTranscription);
+    } catch (error) {
+      console.error('ASR Buffer Transcription Error:', error);
+      throw error;
+    }
+  }
+
   private async uploadAudio(audioBuffer: Buffer): Promise<string> {
     const response = await axios.post(
       'https://api.assemblyai.com/v2/upload',
