@@ -1,5 +1,4 @@
 import { llmService } from './services/llm';
-import { asrService } from './services/asr';
 import { ttsService } from './services/tts';
 import { latencyTracker } from './utils/latencyTracker';
 import { LLMStreamToken, TranscriptionResult, AudioFragment } from './types';
@@ -8,8 +7,7 @@ export class StreamingOrchestrator {
   private sessionId: string;
   private transcriptionBuffer: string = '';
   private responseBuffer: string = '';
-  private silenceTimer: NodeJS.Timeout | null = null;
-  private silenceThreshold: number = 300; // ms
+  private isProcessing = false;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
@@ -17,117 +15,169 @@ export class StreamingOrchestrator {
 
   /**
    * Process incoming transcription from ASR
-   * Immediately stream to LLM without waiting for full response
+   * Only process when transcription is marked as final (user stopped speaking)
    */
-  async onTranscriptionResult(result: TranscriptionResult, onAudioChunk: (audio: AudioFragment) => void, onTextResponse?: (text: string) => void): Promise<void> {
-    latencyTracker.start(this.sessionId, 'transcription_process');
+  async onTranscriptionResult(
+    result: TranscriptionResult,
+    onAudioChunk: (audio: AudioFragment) => void,
+    onTextResponse?: (text: string) => void
+  ): Promise<void> {
+    latencyTracker.start(this.sessionId, 'full_pipeline');
 
-    if (result.isFinal) {
-      this.transcriptionBuffer += result.text + ' ';
-      latencyTracker.log(this.sessionId, `Final transcription: ${result.text}`);
-
-      // Clear silence timer if it exists
-      if (this.silenceTimer) {
-        clearTimeout(this.silenceTimer);
-        this.silenceTimer = null;
-      }
-
-      // Generate response immediately (don't wait for 300ms silence)
-      console.log(`[${this.sessionId}] 📞 Generating response immediately for: "${this.transcriptionBuffer.trim()}"`);
-      await this.generateAndStreamResponse(this.transcriptionBuffer.trim(), onAudioChunk, onTextResponse);
-    } else {
-      latencyTracker.log(this.sessionId, `Partial transcription: ${result.text}`);
+    // Only process final transcriptions (complete sentences)
+    if (!result.isFinal) {
+      console.log(`[${this.sessionId}] ⏳ Partial transcription: "${result.text}" (waiting for complete sentence)`);
+      return;
     }
 
-    latencyTracker.end(this.sessionId, 'transcription_process');
+    // Prevent duplicate processing
+    if (this.isProcessing) {
+      console.log(`[${this.sessionId}] ⚠️ Already processing, skipping duplicate request`);
+      return;
+    }
+
+    this.isProcessing = true;
+    this.transcriptionBuffer = result.text;
+
+    console.log(`[${this.sessionId}] ✅ Final transcription received: "${this.transcriptionBuffer}"`);
+
+    try {
+      await this.generateAndStreamResponse(
+        this.transcriptionBuffer,
+        onAudioChunk,
+        onTextResponse
+      );
+    } catch (error) {
+      console.error(`[${this.sessionId}] Error in orchestrator:`, error);
+    } finally {
+      this.isProcessing = false;
+      latencyTracker.end(this.sessionId, 'full_pipeline');
+    }
   }
 
   /**
-   * Generate LLM response and stream audio in parallel
+   * Generate LLM response and stream TTS audio in real-time
+   * This uses predictive audio generation:
+   * - As LLM generates tokens, start TTS synthesis
+   * - Stream audio chunks to client immediately
+   * - Queue them for playback
    */
-  private async generateAndStreamResponse(userInput: string, onAudioChunk: (audio: AudioFragment) => void, onTextResponse?: (text: string) => void): Promise<void> {
-    if (!userInput.trim()) return;
+  private async generateAndStreamResponse(
+    userInput: string,
+    onAudioChunk: (audio: AudioFragment) => void,
+    onTextResponse?: (text: string) => void
+  ): Promise<void> {
+    if (!userInput.trim()) {
+      console.log(`[${this.sessionId}] ❌ Empty input, skipping`);
+      return;
+    }
 
-    latencyTracker.start(this.sessionId, 'llm_response');
+    latencyTracker.start(this.sessionId, 'llm_stream');
 
     let fullResponse = '';
-    let audioQueue: string[] = [];
-    let hasAnyToken = false;
+    let tokenBuffer = '';
     let audioSent = false;
+    const minTokensForTTS = 5; // Synthesize after accumulating ~5 tokens or punctuation
 
-    // Stream tokens from LLM
-    const tokenHandler = async (token: LLMStreamToken) => {
-      if (token.token && !token.isFinal) {
-        hasAnyToken = true;
-        fullResponse += token.token;
-        audioQueue.push(token.token);
-        
-        console.log(`[${this.sessionId}] LLM Token: "${token.token}" | Full response: "${fullResponse}"`);
-
-        // Generate audio for complete words (words ending with space or punctuation)
-        if (token.token.includes(' ') || token.token.includes('।') || token.token.includes('\n')) {
-          const wordToSynthesize = audioQueue.join('').trim();
-
-          if (wordToSynthesize) {
-            try {
-              console.log(`[${this.sessionId}] TTS: Synthesizing "${wordToSynthesize}"...`);
-              latencyTracker.start(this.sessionId, `tts_${wordToSynthesize.slice(0, 5)}`);
-
-              const audioFragment = await ttsService.synthesize(wordToSynthesize);
-              console.log(`[${this.sessionId}] TTS: Successfully synthesized ${audioFragment.audioBuffer.length} bytes`);
-              audioSent = true;
-              onAudioChunk(audioFragment);
-
-              latencyTracker.end(this.sessionId, `tts_${wordToSynthesize.slice(0, 5)}`);
-            } catch (error) {
-              console.error(`[${this.sessionId}] TTS Error for "${wordToSynthesize}":`, error);
-            }
-          }
-
-          audioQueue = [];
-        }
-      } else if (token.isFinal) {
-        // Synthesize any remaining tokens
-        const remaining = audioQueue.join('').trim();
-        if (remaining) {
-          try {
-            console.log(`[${this.sessionId}] TTS: Synthesizing final remaining "${remaining}"...`);
-            const audioFragment = await ttsService.synthesize(remaining);
-            console.log(`[${this.sessionId}] TTS: Successfully synthesized final ${audioFragment.audioBuffer.length} bytes`);
-            audioSent = true;
-            onAudioChunk(audioFragment);
-          } catch (error) {
-            console.error(`[${this.sessionId}] TTS Error for final "${remaining}":`, error);
-          }
-        }
-
-        this.responseBuffer = fullResponse;
-        latencyTracker.end(this.sessionId, 'llm_response');
-        
-        console.log(`[${this.sessionId}] ✅ LLM Response completed: "${fullResponse}"`);
-        console.log(`[${this.sessionId}] 📊 Tokens received: ${hasAnyToken ? 'YES' : 'NO'}`);
-        console.log(`[${this.sessionId}] 🔊 Audio sent: ${audioSent ? 'YES' : 'NO'}`);
-        
-        // Send text response as fallback if audio failed
-        if (!audioSent && onTextResponse) {
-          console.log(`[${this.sessionId}] 📝 Sending text response as fallback: "${fullResponse}"`);
-          onTextResponse(fullResponse);
-        }
-        
-        latencyTracker.log(this.sessionId, `Response completed: ${fullResponse}`);
-      }
-    };
+    console.log(`[${this.sessionId}] 🚀 Starting LLM stream for: "${userInput}"`);
 
     try {
-      console.log(`[${this.sessionId}] 🤖 Starting LLM stream for: "${userInput}"`);
-      await llmService.streamResponse(userInput, tokenHandler);
-      console.log(`[${this.sessionId}] 🤖 LLM stream handler completed`);
-      
-      if (!hasAnyToken) {
-        console.error(`[${this.sessionId}] ⚠️  WARNING: No tokens received from LLM!`);
-      }
+      await llmService.streamResponse(userInput, async (token: LLMStreamToken) => {
+        if (token.token && !token.isFinal) {
+          // Accumulate tokens
+          fullResponse += token.token;
+          tokenBuffer += token.token;
+
+          console.log(`[${this.sessionId}] 📝 LLM Token: "${token.token}" | Buffer: "${tokenBuffer}"`);
+
+          // Trigger TTS synthesis when we have enough tokens or hit punctuation
+          const shouldSynthesize =
+            tokenBuffer.length >= minTokensForTTS ||
+            tokenBuffer.includes('.') ||
+            tokenBuffer.includes('।') ||
+            tokenBuffer.includes('?') ||
+            tokenBuffer.includes('!') ||
+            tokenBuffer.includes('\n');
+
+          if (shouldSynthesize && tokenBuffer.trim()) {
+            await this.synthesizeAndStreamAudio(
+              tokenBuffer.trim(),
+              onAudioChunk,
+              false
+            );
+            audioSent = true;
+            tokenBuffer = ''; // Clear buffer after synthesis
+          }
+        } else if (token.isFinal) {
+          // Process any remaining tokens
+          if (tokenBuffer.trim()) {
+            await this.synthesizeAndStreamAudio(
+              tokenBuffer.trim(),
+              onAudioChunk,
+              true
+            );
+            audioSent = true;
+          } else if (!audioSent && fullResponse.trim()) {
+            // Fallback: synthesize entire response if streaming didn't work
+            await this.synthesizeAndStreamAudio(
+              fullResponse.trim(),
+              onAudioChunk,
+              true
+            );
+            audioSent = true;
+          }
+
+          this.responseBuffer = fullResponse;
+          console.log(`[${this.sessionId}] ✅ LLM stream complete: "${fullResponse}"`);
+
+          // Send text response as fallback
+          if (!audioSent && onTextResponse) {
+            console.log(`[${this.sessionId}] 📝 Sending text fallback: "${fullResponse}"`);
+            onTextResponse(fullResponse);
+          }
+
+          latencyTracker.end(this.sessionId, 'llm_stream');
+        }
+      });
     } catch (error) {
-      console.error(`[${this.sessionId}] Orchestrator Error:`, error);
+      console.error(`[${this.sessionId}] LLM Error:`, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Synthesize text to audio and stream chunks to client
+   */
+  private async synthesizeAndStreamAudio(
+    text: string,
+    onAudioChunk: (audio: AudioFragment) => void,
+    isFinal: boolean
+  ): Promise<void> {
+    if (!text.trim()) return;
+
+    const ttsSyncKey = `tts_${Date.now()}`;
+    latencyTracker.start(this.sessionId, ttsSyncKey);
+
+    try {
+      console.log(`[${this.sessionId}] 🔊 TTS: Synthesizing "${text}" (final: ${isFinal})`);
+
+      // Synthesize audio
+      const audioFragment = await ttsService.synthesize(text);
+
+      // Send to client immediately
+      onAudioChunk({
+        audioBuffer: audioFragment.audioBuffer,
+        timestamp: audioFragment.timestamp,
+        isFinal: isFinal,
+      });
+
+      console.log(
+        `[${this.sessionId}] ✅ Audio sent: ${audioFragment.audioBuffer.length} bytes (final: ${isFinal})`
+      );
+
+      latencyTracker.end(this.sessionId, ttsSyncKey);
+    } catch (error) {
+      console.error(`[${this.sessionId}] TTS Error for "${text}":`, error);
     }
   }
 
@@ -136,14 +186,13 @@ export class StreamingOrchestrator {
       sessionId: this.sessionId,
       transcriptionBuffer: this.transcriptionBuffer,
       responseBuffer: this.responseBuffer,
+      isProcessing: this.isProcessing,
       metrics: latencyTracker.getMetrics(this.sessionId),
     };
   }
 
   cleanup(): void {
-    if (this.silenceTimer) {
-      clearTimeout(this.silenceTimer);
-    }
+    this.isProcessing = false;
     latencyTracker.clear(this.sessionId);
   }
 }

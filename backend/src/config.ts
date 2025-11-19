@@ -9,7 +9,7 @@ export const config = {
 
   // OpenRouter LLM (FREE)
   OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
-  LLM_MODEL: 'mistralai/mistral-7b-instruct:free', // Free model
+  LLM_MODEL: 'google/gemini-2-flash-001:free', // Google's fast free model
 
   // AssemblyAI ASR (FREE - 600 min/month)
   ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY,

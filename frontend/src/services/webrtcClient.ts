@@ -8,32 +8,26 @@ export interface CallMetrics {
   lastUpdate: number;
 }
 
-// Auto-detect server URL based on current host
 function getServerUrl(): string {
   const host = window.location.hostname;
-  
-  // Check for backend URL in query params first
   const params = new URLSearchParams(window.location.search);
   const backendParam = params.get('backend');
+  
   if (backendParam) {
     console.log('[WebRTC] Using backend from query param:', backendParam);
     return backendParam;
   }
-  
-  // If on ngrok (HTTPS frontend), connect to local network backend
+
   if (host.includes('ngrok-free.dev') || host.includes('ngrok.io')) {
-    // Android frontend on ngrok HTTPS can reach PC's local IP on HTTP
     const localBackend = 'http://192.168.29.53:3000';
-    console.log('[WebRTC] On ngrok frontend, using local network backend:', localBackend);
+    console.log('[WebRTC] On ngrok, using local backend:', localBackend);
     return localBackend;
   }
-  
-  // If accessing from localhost, use localhost:3000
+
   if (host === 'localhost' || host === '127.0.0.1') {
     return `http://localhost:3000`;
   }
-  
-  // If accessing from network IP, use same IP with port 3000
+
   return `http://${host}:3000`;
 }
 
@@ -44,11 +38,23 @@ export class WebRTCClient {
   private isRecording: boolean = false;
   private sessionId: string = '';
 
+  private audioChunks: Blob[] = [];
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
+  private speechDetectionTimeout: ReturnType<typeof setTimeout> | null = null;
+  private SILENCE_THRESHOLD_MS = 600; // 600ms silence = sentence complete (natural pause)
+  private INITIAL_SPEECH_DELAY_MS = 200; // 200ms before checking for silence (quick response)
+  private isSpeaking = false;
+  private lastAudioTime = 0;
+  private isProcessingSentence = false; // Prevent duplicate processing
+
+  private audioQueue: { data: Uint8Array; isLastChunk: boolean }[] = [];
+  private isPlayingAudio = false;
+  private lastRequestId: string = '';
+
   constructor(serverUrl?: string) {
-    // Use provided URL or auto-detect
     const url = serverUrl || getServerUrl();
-    console.log('[WebRTC] Connecting to server at:', url);
-    
+    console.log('[WebRTC] 🔗 Connecting to:', url);
+
     this.socket = io(url, {
       reconnection: true,
       reconnectionDelay: 1000,
@@ -61,35 +67,36 @@ export class WebRTCClient {
 
   private setupListeners() {
     this.socket.on('connect', () => {
-      console.log('[WebRTC] ✅ Connected to server');
+      console.log('[WebRTC] ✅ CONNECTED to server');
       console.log('[WebRTC] Session ID:', this.socket.id);
       this.sessionId = this.socket.id;
     });
 
     this.socket.on('disconnect', () => {
-      console.log('[WebRTC] ❌ Disconnected from server');
+      console.log('[WebRTC] ❌ DISCONNECTED from server');
     });
 
     this.socket.on('connect_error', (error: any) => {
       console.error('[WebRTC] ❌ Connection error:', error);
-      console.error('[WebRTC] Error details:', {
-        message: error.message,
-        type: error.type,
-        data: error.data,
+    });
+
+    this.socket.on('audio_chunk', (data: any) => {
+      // Only accept responses for the current request
+      if (data.requestId && data.requestId !== this.lastRequestId) {
+        console.log(`[WebRTC] ❌ Ignoring response for old request: ${data.requestId} (current: ${this.lastRequestId})`);
+        return;
+      }
+
+      console.log(`[WebRTC] 📥 Audio chunk: ${data.buffer.length} bytes, final=${data.isFinal} [${data.requestId || 'old'}]`);
+      this.audioQueue.push({
+        data: new Uint8Array(data.buffer),
+        isLastChunk: data.isFinal,
       });
-    });
-
-    this.socket.on('audio_acknowledged', (data: any) => {
-      console.log('[WebRTC] Audio acknowledged at', data.timestamp);
-    });
-
-    this.socket.on('audio_response', (data: any) => {
-      console.log('[WebRTC] Audio response received');
-      this.playAudio(data.audio);
+      this.playQueuedAudio();
     });
 
     this.socket.on('text_response', (data: any) => {
-      console.log('[WebRTC] Text response received:', data.text);
+      console.log('[WebRTC] 📝 Text response:', data.text);
     });
 
     this.socket.on('error', (error: any) => {
@@ -99,24 +106,12 @@ export class WebRTCClient {
 
   async startCall() {
     try {
-      console.log('[WebRTC] Requesting microphone access...');
-      
-      // Check if getUserMedia is available
+      console.log('[WebRTC] 🎙️ Requesting microphone...');
+
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        console.error('[WebRTC] navigator.mediaDevices not available');
-        throw new Error(
-          '⚠️ HTTPS Required for Android!\n\n' +
-          'Android needs HTTPS for microphone access.\n\n' +
-          'For PC Testing (HTTP works):\n' +
-          'http://localhost:5173 ✅\n\n' +
-          'For Phone Testing:\n' +
-          'Option 1: Test on PC first\n' +
-          'Option 2: Use ngrok for HTTPS tunnel\n' +
-          '  $ ngrok http 5173'
-        );
+        throw new Error('Microphone not available');
       }
-      
-      // Try different audio constraints for better compatibility
+
       const audioConstraints = {
         audio: {
           echoCancellation: true,
@@ -126,132 +121,196 @@ export class WebRTCClient {
         },
       };
 
-      // Request microphone access
-      this.localStream = await navigator.mediaDevices.getUserMedia(audioConstraints).catch(async (error) => {
-        console.warn('[WebRTC] Advanced audio constraints failed, trying basic constraints:', error);
-        // Fallback to basic audio constraints
-        return await navigator.mediaDevices.getUserMedia({ audio: true });
-      });
-
-      console.log('[WebRTC] Microphone access granted');
-
-      // Set up Media Recorder
-      const mimeType = this.getMediaRecorderMimeType();
-      console.log('[WebRTC] Using MIME type:', mimeType);
-      
-      this.mediaRecorder = new MediaRecorder(this.localStream, {
-        mimeType: mimeType,
-      });
-
-      const audioChunks: Blob[] = [];
-      let silenceTimeout: ReturnType<typeof setTimeout> | null = null;
-      const SILENCE_THRESHOLD = 1500; // ms - detect silence after 1.5 seconds
-
-      const sendAudio = (isFinal: boolean = false) => {
-        if (audioChunks.length === 0) {
-          console.warn(`[WebRTC] No audio chunks to send (final: ${isFinal})`);
-          return;
-        }
-
-        const blob = new Blob(audioChunks, { type: mimeType });
-        blob.arrayBuffer().then((buffer) => {
-          const byteLength = buffer.byteLength;
-          console.log(`[WebRTC] Sending audio: ${byteLength} bytes (final: ${isFinal}), socket connected: ${this.socket.connected}`);
-          
-          if (!this.socket.connected) {
-            console.error('[WebRTC] Socket not connected, cannot send audio');
-            return;
-          }
-          
-          this.socket.emit('audio_chunk', {
-            buffer: new Uint8Array(buffer),
-            isFinal: isFinal,
-            timestamp: Date.now(),
-          });
-        }).catch((err) => {
-          console.error('[WebRTC] Error converting audio blob:', err);
+      this.localStream = await navigator.mediaDevices
+        .getUserMedia(audioConstraints)
+        .catch(async (error) => {
+          console.warn('[WebRTC] Advanced constraints failed:', error);
+          return await navigator.mediaDevices.getUserMedia({ audio: true });
         });
 
-        audioChunks.length = 0;
-      };
+      console.log('[WebRTC] ✅ Microphone granted');
+
+      const mimeType = this.getMediaRecorderMimeType();
+      console.log('[WebRTC] Using MIME type:', mimeType);
+
+      this.mediaRecorder = new MediaRecorder(this.localStream, { mimeType });
+      this.audioChunks = [];
+      this.isSpeaking = false;
+      this.lastAudioTime = 0;
 
       this.mediaRecorder.ondataavailable = (event: BlobEvent) => {
-        console.log(`[WebRTC] Audio data available: ${event.data.size} bytes`);
-        audioChunks.push(event.data);
+        if (event.data.size > 0) {
+          console.log(`[WebRTC] 🎤 Got audio chunk: ${event.data.size} bytes`);
+          this.audioChunks.push(event.data);
+          this.lastAudioTime = Date.now();
 
-        // Clear existing silence timeout
-        if (silenceTimeout) {
-          clearTimeout(silenceTimeout);
+          if (!this.isSpeaking) {
+            this.isSpeaking = true;
+            console.log('[WebRTC] ▶️ SPEAKING STARTED');
+            if (this.silenceTimer) clearTimeout(this.silenceTimer);
+          }
+
+          if (this.speechDetectionTimeout) clearTimeout(this.speechDetectionTimeout);
+
+          this.speechDetectionTimeout = setTimeout(() => {
+            console.log(`[WebRTC] ⏳ Starting silence detection (waiting ${this.SILENCE_THRESHOLD_MS}ms)...`);
+            if (this.silenceTimer) clearTimeout(this.silenceTimer);
+
+            this.silenceTimer = setTimeout(() => {
+              console.log('[WebRTC] 🛑 SILENCE DETECTED - Processing sentence');
+              this.processSentence();
+            }, this.SILENCE_THRESHOLD_MS);
+          }, this.INITIAL_SPEECH_DELAY_MS);
         }
-
-        // Set silence detection - if no new audio for SILENCE_THRESHOLD, send as final
-        silenceTimeout = setTimeout(() => {
-          console.log('[WebRTC] Silence detected, sending final chunk');
-          sendAudio(true); // Send as final when silence detected
-          silenceTimeout = null;
-        }, SILENCE_THRESHOLD);
       };
 
       this.mediaRecorder.onstop = () => {
-        // Send any remaining audio chunks as final when recording stops
-        if (audioChunks.length > 0) {
-          sendAudio(true);
-        }
-        if (silenceTimeout) {
-          clearTimeout(silenceTimeout);
-        }
+        console.log('[WebRTC] ⏹️ Recording stopped');
+        // DON'T process remaining audio here - it was already processed during silence detection
+        // This prevents duplicate/infinite requests
+        this.audioChunks = []; // Clear any leftover chunks
+        this.cleanup();
       };
 
       this.mediaRecorder.onerror = (event: any) => {
-        console.error('[WebRTC] MediaRecorder error:', event.error);
+        console.error('[WebRTC] ❌ Recording error:', event.error);
       };
 
-      this.mediaRecorder.start(100); // Capture every 100ms
+      this.mediaRecorder.start(50);
       this.isRecording = true;
 
-      console.log('[WebRTC] Call started, recording audio');
+      console.log('[WebRTC] ✅ CALL STARTED - Listening for audio...');
     } catch (error: any) {
-      console.error('[WebRTC] Failed to start call:', error);
-      
-      // Provide helpful error messages
-      if (error.name === 'NotAllowedError') {
-        throw new Error('🎤 Microphone permission denied.\n\nOn Android:\n1. Go to Settings\n2. Apps → This Browser\n3. Permissions → Microphone\n4. Select "Allow"');
-      } else if (error.name === 'NotFoundError') {
-        throw new Error('🎤 No microphone found. Please connect a microphone.');
-      } else if (error.name === 'NotReadableError') {
-        throw new Error('🎤 Microphone is in use by another application.');
-      } else if (error.name === 'SecurityError') {
-        throw new Error('🎤 This page must be served over HTTPS or localhost for microphone access.');
-      } else {
-        throw error;
-      }
+      console.error('[WebRTC] ❌ Start call failed:', error);
+      throw error;
     }
+  }
+
+  private processSentence() {
+    // Prevent duplicate processing (e.g., from both silence detection and call stop)
+    if (this.isProcessingSentence) {
+      console.log('[WebRTC] ⚠️ Already processing a sentence, skipping duplicate');
+      return;
+    }
+
+    if (this.audioChunks.length === 0) {
+      console.log('[WebRTC] ⚠️ No audio chunks to process');
+      return;
+    }
+
+    this.isProcessingSentence = true;
+
+    // Generate unique request ID for this utterance
+    this.lastRequestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+
+    const totalSize = this.audioChunks.reduce((sum, blob) => sum + blob.size, 0);
+    console.log(`[WebRTC] 📤 Processing sentence: ${this.audioChunks.length} chunks = ${totalSize} bytes [${this.lastRequestId}]`);
+
+    const mimeType = this.getMediaRecorderMimeType();
+    const blob = new Blob(this.audioChunks, { type: mimeType });
+
+    blob.arrayBuffer().then((buffer) => {
+      console.log(`[WebRTC] 🚀 SENDING TO BACKEND: ${buffer.byteLength} bytes (final: true) [${this.lastRequestId}]`);
+
+      if (!this.socket.connected) {
+        console.error('[WebRTC] ❌ Socket not connected!');
+        this.isProcessingSentence = false;
+        return;
+      }
+
+      // Send request ID so backend and frontend can track this specific request
+      this.socket.emit('audio_chunk', {
+        buffer: new Uint8Array(buffer),
+        isFinal: true,
+        requestId: this.lastRequestId,
+        timestamp: Date.now(),
+      });
+
+      console.log('[WebRTC] ✅ Audio sent to backend');
+      this.isProcessingSentence = false; // Reset flag after sending
+    }).catch((error) => {
+      console.error('[WebRTC] ❌ Error processing audio:', error);
+      this.isProcessingSentence = false; // Reset flag on error
+    });
+
+    this.audioChunks = [];
+    this.isSpeaking = false;
+
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    if (this.speechDetectionTimeout) clearTimeout(this.speechDetectionTimeout);
+  }
+
+  private cleanup() {
+    if (this.silenceTimer) clearTimeout(this.silenceTimer);
+    if (this.speechDetectionTimeout) clearTimeout(this.speechDetectionTimeout);
   }
 
   private getMediaRecorderMimeType(): string {
-    // Try different MIME types in order of preference
-    const types = [
-      'audio/webm;codecs=opus',
-      'audio/webm',
-      'audio/mp4',
-      'audio/ogg',
-      'audio/wav',
-      'audio/aac',
-    ];
-
+    const types = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
     for (const type of types) {
-      if (MediaRecorder.isTypeSupported(type)) {
-        console.log('[WebRTC] Using supported MIME type:', type);
-        return type;
-      }
+      if (MediaRecorder.isTypeSupported(type)) return type;
     }
-
-    // Fallback to default
-    console.warn('[WebRTC] No MIME type supported, using default');
     return 'audio/webm';
   }
 
+  private async playQueuedAudio() {
+    if (this.isPlayingAudio) {
+      console.log('[WebRTC] ⏳ Already playing, queuing...');
+      return;
+    }
+
+    while (this.audioQueue.length > 0) {
+      this.isPlayingAudio = true;
+      const { data, isLastChunk } = this.audioQueue.shift()!;
+
+      try {
+        console.log(`[WebRTC] 🔊 Playing audio chunk: ${data.length} bytes (last: ${isLastChunk})`);
+        await this.playAudioBuffer(data);
+        console.log('[WebRTC] ✅ Audio chunk finished');
+      } catch (error) {
+        console.error('[WebRTC] ❌ Playback error:', error);
+      }
+
+      if (isLastChunk) {
+        console.log('[WebRTC] 🏁 All audio played');
+        this.isPlayingAudio = false;
+        break;
+      }
+    }
+
+    this.isPlayingAudio = false;
+  }
+
+  private playAudioBuffer(buffer: Uint8Array): Promise<void> {
+    return new Promise((resolve, reject) => {
+      try {
+        // Create a new Uint8Array backed by a regular ArrayBuffer
+        const safeBuffer = new Uint8Array(buffer);
+        const audioBlob = new Blob([safeBuffer], { type: 'audio/mp3' });
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+
+        audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          resolve();
+        };
+
+        audio.onerror = (error) => {
+          URL.revokeObjectURL(audioUrl);
+          reject(error);
+        };
+
+        audio.play().catch(reject);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
   async stopCall() {
+    console.log('[WebRTC] 🛑 Stopping call...');
+    this.cleanup();
+
     if (this.mediaRecorder && this.isRecording) {
       this.mediaRecorder.stop();
       this.isRecording = false;
@@ -262,35 +321,7 @@ export class WebRTCClient {
       this.localStream = null;
     }
 
-    console.log('[WebRTC] Call ended');
-  }
-
-  private playAudio(base64Audio: string) {
-    try {
-      const binaryString = atob(base64Audio);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-
-      const audioBlob = new Blob([bytes], { type: 'audio/mp3' });
-      const audioUrl = URL.createObjectURL(audioBlob);
-      const audio = new Audio(audioUrl);
-      audio.play().catch((err) => console.error('Failed to play audio:', err));
-
-      // Clean up URL after playback
-      setTimeout(() => URL.revokeObjectURL(audioUrl), 5000);
-    } catch (error) {
-      console.error('[WebRTC] Failed to play audio:', error);
-    }
-  }
-
-  sendTranscription(text: string, isFinal: boolean) {
-    this.socket.emit('transcription', {
-      text,
-      isFinal,
-      timestamp: Date.now(),
-    });
+    console.log('[WebRTC] ✅ Call stopped');
   }
 
   isConnected(): boolean {
@@ -298,6 +329,7 @@ export class WebRTCClient {
   }
 
   disconnect() {
+    this.cleanup();
     if (this.socket) {
       this.socket.disconnect();
     }
