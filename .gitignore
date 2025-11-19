@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.env
+.env.local
+config/google-cloud-key.json
+*.log
+.DS_Store
+build/
+coverage/
+.vscode/settings.json
