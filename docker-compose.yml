@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - GOOGLE_CLOUD_PROJECT_ID=${GOOGLE_CLOUD_PROJECT_ID}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/config/google-cloud-key.json
+      - REDIS_URL=redis://redis:6379
+    volumes:
+      - ./config:/app/config:ro
+      - ./backend/src:/app/backend/src
+    depends_on:
+      - redis
+    networks:
+      - app-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    image: node:18-alpine
+    working_dir: /app/frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+    environment:
+      - NODE_ENV=development
+    networks:
+      - app-network
+    command: sh -c "npm install && npm run dev"
+
+networks:
+  app-network:
+    driver: bridge
