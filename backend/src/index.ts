@@ -126,19 +126,34 @@ io.on('connection', (socket) => {
         console.log(`[${socket.id}] 🎤 Sending to AssemblyAI for transcription...`);
         
         let transcribedText = '';
+        let transcriptionError: string | null = null;
         
-        await orchestrator.transcribeAudio(
-          combinedAudio,
-          (transcription) => {
-            transcribedText = transcription.text;
-            console.log(`[${socket.id}] ✅ Transcribed: "${transcribedText}"`);
-          }
-        );
-
-        if (!transcribedText.trim()) {
-          console.log(`[${socket.id}] ⚠️ No transcription received`);
+        try {
+          await orchestrator.transcribeAudio(
+            combinedAudio,
+            (transcription) => {
+              transcribedText = transcription.text;
+              console.log(`[${socket.id}] ✅ Transcribed: "${transcribedText}"`);
+            }
+          );
+        } catch (transcribeError: any) {
+          transcriptionError = transcribeError.message;
+          console.error(`[${socket.id}] ❌ Transcription failed:`, transcribeError.message);
+          
+          // Send error to frontend
           socket.emit('text_response', {
-            text: 'No speech detected. Please speak again.',
+            text: `Transcription error: ${transcribeError.message}. Please check your audio and try again.`,
+            timestamp: Date.now(),
+            isFinal: true,
+            error: true,
+          });
+          return;
+        }
+
+        if (!transcribedText || !transcribedText.trim()) {
+          console.log(`[${socket.id}] ⚠️ No transcription received (empty result)`);
+          socket.emit('text_response', {
+            text: 'No speech detected. Please speak clearly and try again.',
             timestamp: Date.now(),
             isFinal: true,
           });
@@ -181,8 +196,12 @@ io.on('connection', (socket) => {
           message: `Processing failed: ${error}`,
         });
       } finally {
+        // CRITICAL: Always reset these flags - even on error!
         isWaitingForFinalAudio = false;
+        audioBuffer = []; // Clear buffer to prevent corruption
+        lastProcessedRequestId = requestId; // Mark as processed
         latencyTracker.end(socket.id, 'audio_receive');
+        console.log(`[${socket.id}] ✅ Session ready for next audio chunk`);
       }
     }
 
