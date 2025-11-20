@@ -11,12 +11,12 @@ export class LLMService {
   private model: string;
 
   constructor() {
-    this.apiKey = config.OPENROUTER_API_KEY || '';
+    this.apiKey = config.GROQ_API_KEY || '';
     this.model = config.LLM_MODEL;
 
     if (!this.apiKey) {
-      console.warn('⚠️  OPENROUTER_API_KEY not set. LLM will not work.');
-      console.warn('Set OPENROUTER_API_KEY in .env to use LLM features');
+      console.warn('⚠️  GROQ_API_KEY not set. LLM will not work.');
+      console.warn('Get free key at https://console.groq.com/keys');
     }
   }
 
@@ -47,21 +47,21 @@ export class LLMService {
     };
 
     try {
-      console.log(`[LLM] Calling OpenRouter API with model: ${this.model}`);
-      const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      console.log(`[LLM] Calling Groq API with model: ${this.model}`);
+      const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${this.apiKey}`,
           'Content-Type': 'application/json',
-          'HTTP-Referer': 'http://localhost:3000',
-          'X-Title': 'Hindi AI Calling System',
         },
         body: JSON.stringify(payload),
       });
 
       if (!response.ok) {
+        const errorText = await response.text();
         console.error(`[LLM] API Error: ${response.statusText} - ${response.status}`);
-        throw new Error(`OpenRouter API error: ${response.statusText}`);
+        console.error(`[LLM] Error details: ${errorText}`);
+        throw new Error(`Groq API error: ${response.statusText}`);
       }
 
       console.log(`[LLM] Response received, starting to read stream...`);

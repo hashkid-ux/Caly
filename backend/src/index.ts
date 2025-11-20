@@ -26,6 +26,11 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.header('Permissions-Policy', 'microphone=*, camera=*');
+  
+  // Allow mixed content (HTTPS frontend → HTTP backend)
+  res.header('X-Content-Type-Options', 'nosniff');
+  res.header('Cross-Origin-Embedder-Policy', 'require-corp');
+  res.header('Cross-Origin-Resource-Policy', 'cross-origin');
 
   if (req.method === 'OPTIONS') {
     res.sendStatus(200);
@@ -159,6 +164,14 @@ io.on('connection', (socket) => {
           });
           return;
         }
+
+        // Send transcription back to frontend so user can see what was heard
+        console.log(`[${socket.id}] 📤 Sending transcription to frontend: "${transcribedText}"`);
+        socket.emit('transcription', {
+          text: transcribedText,
+          timestamp: Date.now(),
+          requestId: requestId,
+        });
 
         // Now process the transcribed text with LLM and TTS
         await orchestrator.onTranscriptionResult(

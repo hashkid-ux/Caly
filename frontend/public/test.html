@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Socket.io Connection Test</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        body { font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4; }
+        .log { background: #252526; padding: 10px; margin: 5px 0; border-radius: 4px; }
+        .success { color: #4ec9b0; }
+        .error { color: #f48771; }
+        .info { color: #9cdcfe; }
+        button { padding: 10px 20px; margin: 10px 0; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <h2>Socket.io Connection Diagnostics</h2>
+    <div id="logs"></div>
+    <button onclick="testConnection()">Test Connection</button>
+    <button onclick="clearLogs()">Clear Logs</button>
+
+    <script>
+        const logsDiv = document.getElementById('logs');
+        
+        function log(msg, type = 'info') {
+            const span = document.createElement('div');
+            span.className = `log ${type}`;
+            span.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logsDiv.appendChild(span);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+
+        function clearLogs() {
+            logsDiv.innerHTML = '';
+        }
+
+        function testConnection() {
+            clearLogs();
+            log('🔍 Starting diagnostics...', 'info');
+            
+            // Get backend URL from query param or default
+            const params = new URLSearchParams(window.location.search);
+            let backendUrl = params.get('backend');
+            
+            if (!backendUrl) {
+                // Try ngrok detection
+                const protocol = window.location.protocol === 'https:' ? 'https' : 'http';
+                const host = window.location.host;
+                if (host.includes('ngrok')) {
+                    backendUrl = `${protocol}://${host.replace('5174', '3000')}`;
+                    log(`🌐 Detected ngrok, trying backend: ${backendUrl}`, 'info');
+                } else {
+                    backendUrl = 'http://192.168.29.53:3000';
+                    log(`📍 Local network, using: ${backendUrl}`, 'info');
+                }
+            } else {
+                log(`📍 Query param backend: ${backendUrl}`, 'info');
+            }
+
+            log(`🔗 Attempting connection to: ${backendUrl}`, 'info');
+            log(`🌐 Current frontend URL: ${window.location.origin}`, 'info');
+
+            const socket = io(backendUrl, {
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionDelayMax: 3000,
+                reconnectionAttempts: 5,
+                timeout: 10000,
+                transports: ['websocket', 'polling'],
+                rememberUpgrade: true,
+            });
+
+            socket.on('connect', () => {
+                log(`✅ CONNECTED! Socket ID: ${socket.id}`, 'success');
+                log(`📊 Transport: ${socket.io.engine.transport.name}`, 'success');
+            });
+
+            socket.on('connect_error', (error) => {
+                log(`❌ Connection error: ${error.message}`, 'error');
+                log(`   Type: ${error.type}`, 'error');
+                log(`   Code: ${error.code}`, 'error');
+            });
+
+            socket.on('disconnect', (reason) => {
+                log(`🔌 Disconnected: ${reason}`, 'error');
+            });
+
+            socket.on('error', (error) => {
+                log(`⚠️ Socket error: ${error}`, 'error');
+            });
+
+            // Test message
+            setTimeout(() => {
+                if (socket.connected) {
+                    log('📤 Sending test_connection message...', 'info');
+                    socket.emit('test_connection', { timestamp: Date.now() }, (response) => {
+                        log(`📥 Response received: ${JSON.stringify(response)}`, 'success');
+                    });
+                } else {
+                    log('⚠️ Not connected, skipping test message', 'error');
+                }
+            }, 2000);
+        }
+
+        // Auto-test on load
+        window.addEventListener('load', () => {
+            setTimeout(testConnection, 500);
+        });
+    </script>
+</body>
+</html>

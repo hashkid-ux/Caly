@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Connection Diagnostics</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body { 
+            font-family: 'Courier New', monospace; 
+            padding: 20px; 
+            background: #1e1e1e; 
+            color: #d4d4d4;
+            margin: 0;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { color: #4ec9b0; border-bottom: 2px solid #4ec9b0; padding-bottom: 10px; }
+        .section { margin: 20px 0; padding: 15px; background: #252526; border-radius: 4px; border-left: 4px solid #ce9178; }
+        .success { border-left-color: #4ec9b0; }
+        .error { border-left-color: #f48771; }
+        .warning { border-left-color: #ce9178; }
+        .info { border-left-color: #9cdcfe; }
+        label { color: #9cdcfe; font-weight: bold; }
+        input { 
+            background: #1e1e1e; 
+            color: #d4d4d4; 
+            border: 1px solid #555; 
+            padding: 8px; 
+            width: 100%;
+            margin-top: 5px;
+            border-radius: 4px;
+            font-family: monospace;
+        }
+        button { 
+            padding: 10px 20px; 
+            margin: 10px 5px 10px 0; 
+            cursor: pointer; 
+            background: #0e639c; 
+            color: white; 
+            border: none; 
+            border-radius: 4px;
+            font-family: monospace;
+            font-weight: bold;
+        }
+        button:hover { background: #1177bb; }
+        button:active { background: #0a4a8b; }
+        .logs { 
+            background: #1e1e1e; 
+            border: 1px solid #555; 
+            border-radius: 4px;
+            padding: 10px;
+            height: 300px;
+            overflow-y: auto;
+            margin-top: 10px;
+        }
+        .log-line { 
+            padding: 4px; 
+            margin: 2px 0;
+            border-left: 2px solid transparent;
+            padding-left: 8px;
+        }
+        .log-success { color: #4ec9b0; border-color: #4ec9b0; }
+        .log-error { color: #f48771; border-color: #f48771; }
+        .log-warning { color: #ce9178; border-color: #ce9178; }
+        .log-info { color: #9cdcfe; border-color: #9cdcfe; }
+        .status-badge { 
+            display: inline-block; 
+            padding: 4px 12px; 
+            border-radius: 12px; 
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        .status-connecting { background: #ce9178; color: #1e1e1e; }
+        .status-connected { background: #4ec9b0; color: #1e1e1e; }
+        .status-failed { background: #f48771; color: white; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 Socket.io Diagnostics</h1>
+        
+        <div class="section info">
+            <label>Frontend URL:</label>
+            <input type="text" id="frontendUrl" readonly>
+        </div>
+
+        <div class="section warning">
+            <label>Backend URL (or use ?backend=YOUR_URL):</label>
+            <input type="text" id="backendUrl" placeholder="http://192.168.29.53:3000">
+            <button onclick="setCustomBackend()">💾 Save URL</button>
+        </div>
+
+        <div class="section">
+            <button onclick="testConnection()">🔄 Test Connection</button>
+            <button onclick="clearLogs()">🗑️ Clear Logs</button>
+            <span id="status" class="status-badge"></span>
+        </div>
+
+        <div class="section">
+            <label>Connection Logs:</label>
+            <div class="logs" id="logs"></div>
+        </div>
+
+        <div class="section info">
+            <h3>Common Issues:</h3>
+            <ul>
+                <li><strong>Timeout:</strong> Backend not running or unreachable</li>
+                <li><strong>Protocol Mismatch:</strong> HTTPS frontend can't reach HTTP backend (mixed content)</li>
+                <li><strong>CORS Error:</strong> Backend blocking your domain</li>
+                <li><strong>Wrong Port:</strong> Make sure backend is on port 3000</li>
+            </ul>
+        </div>
+
+        <div class="section warning">
+            <h3>🔒 For ngrok HTTPS → HTTP Backend:</h3>
+            <p>Tunnel backend too:</p>
+            <code style="background: #1e1e1e; display: block; padding: 10px; margin: 10px 0; border-radius: 4px;">
+                cd d:\caly\backend && npx ngrok http 3000
+            </code>
+            <p>Then use ngrok backend URL in query param:</p>
+            <code style="background: #1e1e1e; display: block; padding: 10px; margin: 10px 0; border-radius: 4px;">
+                ?backend=https://xxxx-yyyy-zzz.ngrok-free.dev
+            </code>
+        </div>
+    </div>
+
+    <script>
+        const logsDiv = document.getElementById('logs');
+        const statusSpan = document.getElementById('status');
+        let currentSocket = null;
+
+        function log(msg, type = 'info') {
+            const line = document.createElement('div');
+            line.className = `log-line log-${type}`;
+            line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logsDiv.appendChild(line);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+
+        function updateStatus(text, type = 'info') {
+            statusSpan.textContent = text;
+            statusSpan.className = `status-badge status-${type}`;
+        }
+
+        function clearLogs() {
+            logsDiv.innerHTML = '';
+        }
+
+        function setCustomBackend() {
+            const url = document.getElementById('backendUrl').value;
+            if (url) {
+                window.location.href = window.location.pathname + '?backend=' + encodeURIComponent(url);
+            }
+        }
+
+        function getBackendUrl() {
+            const params = new URLSearchParams(window.location.search);
+            let backendUrl = params.get('backend');
+            
+            if (!backendUrl) {
+                backendUrl = 'http://192.168.29.53:3000';
+                log('⚠️ No backend URL in query param, using default', 'warning');
+            }
+            
+            document.getElementById('backendUrl').value = backendUrl;
+            return backendUrl;
+        }
+
+        function testConnection() {
+            if (currentSocket) {
+                currentSocket.disconnect();
+            }
+            
+            clearLogs();
+            updateStatus('Connecting...', 'connecting');
+            
+            const backendUrl = getBackendUrl();
+            
+            document.getElementById('frontendUrl').value = window.location.href;
+            log(`🔗 Backend: ${backendUrl}`, 'info');
+            log(`🌐 Frontend: ${window.location.origin}`, 'info');
+            
+            // Check protocol mismatch
+            const frontendProtocol = window.location.protocol.replace(':', '');
+            const backendProtocol = backendUrl.split(':')[0];
+            
+            if (frontendProtocol !== backendProtocol) {
+                log(`⚠️ PROTOCOL MISMATCH: ${frontendProtocol.toUpperCase()} → ${backendProtocol.toUpperCase()}`, 'warning');
+                if (frontendProtocol === 'https' && backendProtocol === 'http') {
+                    log('   🔒 HTTPS cannot request HTTP (mixed content)', 'error');
+                    log('   💡 Solution: Use ngrok for backend too!', 'info');
+                }
+            }
+
+            currentSocket = io(backendUrl, {
+                reconnection: true,
+                reconnectionDelay: 1000,
+                reconnectionDelayMax: 3000,
+                reconnectionAttempts: 5,
+                timeout: 10000,
+                transports: ['websocket', 'polling'],
+                rememberUpgrade: true,
+                // Debug mode
+                extraHeaders: {
+                    'X-Test': 'diagnostic'
+                }
+            });
+
+            currentSocket.on('connect', () => {
+                const transport = currentSocket.io.engine.transport.name;
+                log(`✅ CONNECTED!`, 'success');
+                log(`   Socket ID: ${currentSocket.id}`, 'success');
+                log(`   Transport: ${transport}`, 'success');
+                updateStatus('✅ Connected', 'connected');
+                
+                // Send test message
+                setTimeout(() => {
+                    log('📤 Sending test ping...', 'info');
+                    currentSocket.emit('ping', { time: Date.now() });
+                }, 500);
+            });
+
+            currentSocket.on('connect_error', (error) => {
+                log(`❌ Connection Error: ${error.message || error}`, 'error');
+                updateStatus('❌ Connection Failed', 'failed');
+                
+                if (error.data?.content?.message) {
+                    log(`   Details: ${error.data.content.message}`, 'error');
+                }
+            });
+
+            currentSocket.on('error', (error) => {
+                log(`⚠️ Socket Error: ${error}`, 'error');
+            });
+
+            currentSocket.on('disconnect', (reason) => {
+                log(`🔌 Disconnected: ${reason}`, 'warning');
+                if (reason !== 'io client namespace disconnect') {
+                    updateStatus('Disconnected', 'failed');
+                }
+            });
+
+            // Connection stage tracking
+            currentSocket.io.on('open', () => {
+                log('📡 Transport socket opened', 'info');
+            });
+            
+            currentSocket.io.on('close', (reason) => {
+                log(`❌ Transport closed: ${reason}`, 'warning');
+            });
+
+            currentSocket.io.on('error', (error) => {
+                log(`⚠️ Transport error: ${error}`, 'error');
+            });
+
+            currentSocket.io.engine.on('upgrade', (transport) => {
+                log(`⬆️ Upgraded transport to: ${transport.name}`, 'success');
+            });
+
+            // Timeout check
+            const timeoutHandle = setTimeout(() => {
+                if (currentSocket && !currentSocket.connected) {
+                    log('⏱️ Timeout: Connection took too long', 'error');
+                    log('   Possible causes:', 'info');
+                    log('   • Backend not running', 'info');
+                    log('   • Firewall blocking connection', 'info');
+                    log('   • Network unreachable', 'info');
+                    log('   • CORS/protocol mismatch', 'info');
+                    updateStatus('⏱️ Timeout', 'failed');
+                }
+            }, 12000);
+
+            // Store for cleanup
+            currentSocket._timeoutHandle = timeoutHandle;
+        }
+
+        // Initialize
+        window.addEventListener('load', () => {
+            document.getElementById('frontendUrl').value = window.location.href;
+            document.getElementById('backendUrl').value = getBackendUrl();
+            setTimeout(testConnection, 500);
+        });
+    </script>
+</body>
+</html>

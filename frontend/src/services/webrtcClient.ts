@@ -9,6 +9,7 @@ export interface CallMetrics {
 }
 
 function getServerUrl(): string {
+  const protocol = window.location.protocol; // http: or https:
   const host = window.location.hostname;
   const params = new URLSearchParams(window.location.search);
   const backendParam = params.get('backend');
@@ -19,24 +20,24 @@ function getServerUrl(): string {
     return backendParam;
   }
 
-  // If on ngrok, try to use ngrok tunnel for backend (if available)
-  if (host.includes('ngrok-free.dev') || host.includes('ngrok.io')) {
-    // Construct ngrok backend URL (replace frontend subdomain with backend if both on ngrok)
-    // Format: something-ngrok-free.app → use same tunnel but port 3000
-    const backendUrl = `http://${host.replace(':5173', '')}:3000`;
-    console.log('[WebRTC] 🌐 On ngrok, attempting ngrok backend tunnel:', backendUrl);
-    return backendUrl;
+  // If on ngrok HTTPS frontend, try HTTP backend on local network
+  if (host.includes('ngrok-free.dev') || host.includes('ngrok.io') || host.includes('ngrok.app')) {
+    // ngrok frontend can access HTTP backend on local network via query param
+    // User must provide: ?backend=http://192.168.29.53:3000
+    console.log('[WebRTC] 🌐 On ngrok - expecting backend URL in query param', 'backend=http://YOUR_IP:3000');
+    console.log('[WebRTC] ℹ️ Attempting local network IP...');
+    return `http://192.168.29.53:3000`; // Fallback to local IP
   }
 
-  // Local network - use localhost
+  // Local network - use same protocol as frontend
   if (host === 'localhost' || host === '127.0.0.1') {
     console.log('[WebRTC] 🏠 Using localhost backend');
-    return `http://localhost:3000`;
+    return `${protocol}//localhost:3000`;
   }
 
-  // Same network - use local IP
-  console.log('[WebRTC] 🔗 Using same-network backend');
-  return `http://${host}:3000`;
+  // Same network - use same protocol as frontend (usually http://)
+  console.log('[WebRTC] 🔗 Using same-network backend with', protocol);
+  return `${protocol}//${host}:3000`;
 }
 
 export class WebRTCClient {
@@ -60,17 +61,37 @@ export class WebRTCClient {
   private isPlayingAudio = false;
   private currentRequestId: string = '';
   private audioContext: AudioContext | null = null;
+  lastRequestId: any;
+
+  // Callbacks for UI updates
+  public onTranscription: ((text: string) => void) | null = null;
+  public onResponse: ((text: string) => void) | null = null;
+  public onAudioChunk: ((chunk: Uint8Array, isFinal: boolean) => void) | null = null;
+  public onError: ((error: string) => void) | null = null;
 
   constructor(serverUrl?: string) {
     const url = serverUrl || getServerUrl();
-    console.log('[WebRTC] 🔗 Connecting to:', url);
+    console.log('[WebRTC] 🔗 Attempting to connect to:', url);
+
+    // Check if we're in a mixed-content scenario (HTTPS frontend → HTTP backend)
+    const isMixedContent = window.location.protocol === 'https:' && url.startsWith('http://');
+    const transports = isMixedContent 
+      ? ['polling'] // Polling is "upgradable" and works with mixed content
+      : ['websocket', 'polling']; // Prefer websocket for same-protocol
+
+    if (isMixedContent) {
+      console.log('[WebRTC] ⚠️  Mixed content detected (HTTPS→HTTP), using polling transport only');
+    }
 
     this.socket = io(url, {
       reconnection: true,
       reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      reconnectionAttempts: 5,
-      transports: ['websocket', 'polling'],
+      reconnectionDelayMax: 3000,
+      reconnectionAttempts: 10,
+      timeout: 15000, // Give polling more time
+      transports: transports, // Use polling for mixed content, websocket otherwise
+      rememberUpgrade: true,
+      autoConnect: true,
     });
 
     this.setupListeners();
@@ -79,48 +100,78 @@ export class WebRTCClient {
   private setupListeners() {
     this.socket.on('connect', () => {
       console.log('[WebRTC] ✅ CONNECTED to server');
+      console.log('[WebRTC] Session ID:', this.socket.id);
+      console.log('[WebRTC] Transport:', this.socket.io.engine.transport.name);
       this.sessionId = this.socket.id;
     });
 
-    this.socket.on('disconnect', () => {
-      console.log('[WebRTC] ❌ DISCONNECTED from server');
+    this.socket.on('disconnect', (reason: string) => {
+      console.log('[WebRTC] ❌ DISCONNECTED -', reason);
     });
 
     this.socket.on('connect_error', (error: any) => {
       console.error('[WebRTC] ❌ Connection error:', error);
-    });
-
-    this.socket.on('audio_chunk', (data: any) => {
-      // Ignore responses from old requests
-      if (data.requestId && data.requestId !== this.currentRequestId) {
-        console.log(`[WebRTC] ⏭️ Skipping old response: ${data.requestId}`);
-        return;
-      }
-
-      console.log(`[WebRTC] 📥 Audio chunk: ${data.buffer.length} bytes, final=${data.isFinal}`);
-      this.audioQueue.push({
-        data: new Uint8Array(data.buffer),
-        isLastChunk: data.isFinal,
-        requestId: data.requestId || '',
-      });
-      this.playQueuedAudio();
-    });
-
-    this.socket.on('text_response', (data: any) => {
-      console.log('[WebRTC] 📝 Text response:', data.text);
+      console.error('[WebRTC] Error type:', error?.type);
+      console.error('[WebRTC] Error message:', error?.message);
     });
 
     this.socket.on('error', (error: any) => {
       console.error('[WebRTC] ❌ Socket error:', error);
     });
+
+    this.socket.on('audio_chunk', (data: any) => {
+      // Store the request ID for this response sequence
+      if (data.requestId) {
+        this.lastRequestId = data.requestId;
+      }
+
+      console.log(`[WebRTC] 📥 Audio chunk: ${data.buffer.length} bytes, final=${data.isFinal}, requestId=${data.requestId}`);
+      this.audioQueue.push({
+        data: new Uint8Array(data.buffer),
+        isLastChunk: data.isFinal,
+        requestId: data.requestId || ''
+      });
+      this.playQueuedAudio();
+    });
+
+    this.socket.on('text_response', (data: any) => {
+      console.log(`[WebRTC] 📝 Text response: "${data.text}"`);
+      if (this.onResponse) {
+        this.onResponse(data.text);
+      }
+    });
+
+    this.socket.on('transcription', (data: any) => {
+      console.log(`[WebRTC] 🎤 Transcription received: "${data.text}"`);
+      if (this.onTranscription) {
+        this.onTranscription(data.text);
+      }
+    });
+
+    this.socket.on('audio_acknowledged', (data: any) => {
+      console.log(`[WebRTC] ✅ Audio acknowledged - ${data.buffered} chunks in buffer`);
+    });
+
+    this.socket.on('transcribe_fallback', (data: any) => {
+      console.log(`[WebRTC] ⚠️ Fallback transcription needed: ${data.reason}`);
+    });
   }
 
   async startCall() {
     try {
+      const isAndroid = navigator.userAgent.toLowerCase().includes('android');
+      const isHttps = window.location.protocol === 'https:';
+      
       console.log('[WebRTC] 🎙️ Requesting microphone...');
+      console.log(`[WebRTC] 📱 Device: ${isAndroid ? 'Android' : 'Other'}, Protocol: ${window.location.protocol}`);
 
       if (!navigator.mediaDevices?.getUserMedia) {
         throw new Error('Microphone not supported in this browser');
+      }
+
+      // Android requires HTTPS for microphone access
+      if (isAndroid && !isHttps) {
+        throw new Error('🔒 Android requires HTTPS connection for microphone access. Please use ngrok or HTTPS server.');
       }
 
       // Enhanced audio constraints for better quality
@@ -136,7 +187,10 @@ export class WebRTCClient {
 
       this.localStream = await navigator.mediaDevices
         .getUserMedia(audioConstraints)
-        .catch(() => navigator.mediaDevices.getUserMedia({ audio: true }));
+        .catch((err) => {
+          console.warn('[WebRTC] ⚠️ Enhanced constraints failed, trying basic audio:', err.message);
+          return navigator.mediaDevices.getUserMedia({ audio: true });
+        });
 
       console.log('[WebRTC] ✅ Microphone access granted');
 
@@ -148,7 +202,8 @@ export class WebRTCClient {
       console.log('[WebRTC] ✅ CALL STARTED - Ready to listen');
     } catch (error: any) {
       console.error('[WebRTC] ❌ Start call failed:', error);
-      throw new Error(`Microphone access failed: ${error.message}`);
+      const errorMsg = error.message || error.name || 'Unknown error';
+      throw new Error(`Microphone access failed: ${errorMsg}`);
     }
   }
 
@@ -229,18 +284,21 @@ export class WebRTCClient {
     // Validate minimum duration
     if (recordingDuration < this.MIN_AUDIO_DURATION_MS) {
       console.log(`[WebRTC] ⏭️ Audio too short (${recordingDuration}ms), skipping`);
-      this.resetRecordingState();
+      this.resetRecordingStatePartially(); // Keep recording, just reset flags
       return;
     }
 
     if (this.currentRecordingChunks.length === 0) {
       console.log('[WebRTC] ⚠️ No chunks to process');
-      this.resetRecordingState();
+      this.resetRecordingStatePartially(); // Keep recording
       return;
     }
 
     console.log('[WebRTC] 🔇 Silence detected - processing utterance');
     await this.processUtterance();
+    
+    // Continue listening for next utterance instead of stopping
+    this.resetRecordingStatePartially();
   }
 
   private async processUtterance() {
@@ -295,12 +353,24 @@ export class WebRTCClient {
     } catch (error) {
       console.error('[WebRTC] ❌ Error processing utterance:', error);
     } finally {
-      this.resetRecordingState();
+      // Don't fully reset - keep recording for next utterance
       this.isProcessing = false;
     }
   }
 
   private resetRecordingState() {
+    this.currentRecordingChunks = [];
+    this.isSpeechActive = false;
+    this.recordingStartTime = 0;
+    
+    if (this.silenceTimer) {
+      clearTimeout(this.silenceTimer);
+      this.silenceTimer = null;
+    }
+  }
+
+  private resetRecordingStatePartially() {
+    // Reset only the chunks and speech state, keep recording active
     this.currentRecordingChunks = [];
     this.isSpeechActive = false;
     this.recordingStartTime = 0;

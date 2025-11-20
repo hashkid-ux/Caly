@@ -29,6 +29,22 @@ export const CallInterface: React.FC = () => {
     // Initialize WebRTC client
     clientRef.current = new WebRTCClient(backendUrl || undefined);
 
+    // Set up callbacks for responses
+    clientRef.current.onResponse = (text: string) => {
+      console.log('[CallInterface] Received response:', text);
+      setResponse(text);
+    };
+
+    clientRef.current.onTranscription = (text: string) => {
+      console.log('[CallInterface] Received transcription:', text);
+      setTranscript(text);
+    };
+
+    clientRef.current.onError = (error: string) => {
+      console.error('[CallInterface] Received error:', error);
+      setErrorMessage(`❌ ${error}`);
+    };
+
     // Check connection status
     const checkConnection = () => {
       if (clientRef.current) {

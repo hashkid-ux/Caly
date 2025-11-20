@@ -7,9 +7,9 @@ export const config = {
   PORT: process.env.PORT || 3000,
   NODE_ENV: process.env.NODE_ENV || 'development',
 
-  // OpenRouter LLM (FREE)
-  OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
-  LLM_MODEL: 'openrouter/sherlock-dash-alpha', // Tested & working free model
+  // Groq LLM (FREE - ultra fast, no credit card needed)
+  GROQ_API_KEY: process.env.GROQ_API_KEY,
+  LLM_MODEL: 'llama-3.3-70b-versatile', // Latest production model, great for Hindi
 
   // AssemblyAI ASR (FREE - 600 min/month)
   ASSEMBLYAI_API_KEY: process.env.ASSEMBLYAI_API_KEY,
