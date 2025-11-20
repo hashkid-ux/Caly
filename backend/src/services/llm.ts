@@ -22,7 +22,8 @@ export class LLMService {
 
   async streamResponse(
     userMessage: string,
-    onToken: (token: LLMStreamToken) => void
+    onToken: (token: LLMStreamToken) => void,
+    conversationHistory?: { role: "user" | "assistant"; content: string; }[]
   ): Promise<string> {
     console.log(`[LLM] Starting stream for: "${userMessage}"`);
     

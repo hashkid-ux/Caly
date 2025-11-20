@@ -6,85 +6,83 @@ import { LLMStreamToken, TranscriptionResult, AudioFragment } from './types';
 
 export class StreamingOrchestrator {
   private sessionId: string;
-  private transcriptionBuffer: string = '';
-  private responseBuffer: string = '';
+  private conversationHistory: { role: 'user' | 'assistant'; content: string }[] = [];
   private isProcessing = false;
-  private currentRequestId: string = ''; // PRODUCTION: Request tracking
-  private readonly HINDI_SENTENCE_ENDINGS = ['।', '?', '!']; // PRODUCTION: Hindi sentence ends
+  private audioQueue: Promise<void>[] = [];
+
+  // Performance optimization
+  private readonly MIN_TEXT_LENGTH = 3; // Minimum chars to process
+  private readonly TTS_CHUNK_SIZE = 8; // Tokens before TTS (ultra-fast)
+  private readonly MAX_RESPONSE_TOKENS = 150;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
   }
 
   /**
-   * REAL FIX: Transcribe audio buffer to text using AssemblyAI
+   * Transcribe audio to text
    */
   async transcribeAudio(
     audioBuffer: Buffer,
     onResult: (result: TranscriptionResult) => void
   ): Promise<void> {
+    const startTime = Date.now();
+    
     try {
-      console.log(`[${this.sessionId}] 🔊 Starting transcription... (${audioBuffer.length} bytes)`);
-      await asrService.transcribeBuffer(audioBuffer, onResult);
+      console.log(`[${this.sessionId}] 🎤 Transcribing ${audioBuffer.length} bytes...`);
+      
+      await asrService.transcribeBuffer(audioBuffer, (result) => {
+        const latency = Date.now() - startTime;
+        console.log(`[${this.sessionId}] ✅ Transcribed in ${latency}ms: "${result.text}"`);
+        onResult({ ...result, latency });
+      });
     } catch (error) {
-      console.error(`[${this.sessionId}] ❌ Transcription error:`, error);
+      console.error(`[${this.sessionId}] ❌ Transcription failed:`, error);
       throw error;
     }
   }
 
   /**
-   * PRODUCTION: Smart Hindi sentence detection
-   * Now more flexible - accept any non-empty transcription
-   */
-  private isSentenceComplete(text: string): boolean {
-    const trimmed = text.trim();
-    // Accept any meaningful text (3+ chars) - Hindi punctuation optional
-    return trimmed.length >= 3;
-  }
-
-  /**
-   * Process incoming transcription from ASR
-   * Only process when transcription is marked as final (user stopped speaking)
+   * Process transcription result and generate response
    */
   async onTranscriptionResult(
     result: TranscriptionResult,
     onAudioChunk: (audio: AudioFragment) => void,
     onTextResponse?: (text: string) => void
   ): Promise<void> {
-    latencyTracker.start(this.sessionId, 'full_pipeline');
-
-    // Only process final transcriptions (complete sentences)
-    if (!result.isFinal) {
-      console.log(`[${this.sessionId}] ⏳ Partial transcription: "${result.text}" (waiting for complete sentence)`);
+    if (!result.isFinal || this.isProcessing) {
       return;
     }
 
-    // Prevent duplicate processing
-    if (this.isProcessing) {
-      console.log(`[${this.sessionId}] ⚠️ Already processing`);
-      return;
-    }
-
-    // PRODUCTION: Validate we have meaningful text (3+ chars is enough for Hindi/English)
-    if (!this.isSentenceComplete(result.text)) {
-      console.log(`[${this.sessionId}] ⏳ Waiting for meaningful input (text too short)...`);
+    const userText = result.text.trim();
+    
+    // Validate input
+    if (userText.length < this.MIN_TEXT_LENGTH) {
+      console.log(`[${this.sessionId}] ⏭️ Input too short (${userText.length} chars)`);
       return;
     }
 
     this.isProcessing = true;
-    this.currentRequestId = `req_${Date.now()}`;
-    this.transcriptionBuffer = result.text;
-
-    console.log(`[${this.sessionId}] ✅ Final: "${this.transcriptionBuffer}" [${this.currentRequestId}]`);
+    latencyTracker.start(this.sessionId, 'full_pipeline');
 
     try {
-      await this.generateAndStreamResponse(
-        this.transcriptionBuffer,
-        onAudioChunk,
-        onTextResponse
-      );
+      console.log(`[${this.sessionId}] 💬 User: "${userText}"`);
+      
+      // Add to conversation history
+      this.conversationHistory.push({ role: 'user', content: userText });
+      
+      // Keep only last 6 messages (3 turns) for context
+      if (this.conversationHistory.length > 6) {
+        this.conversationHistory = this.conversationHistory.slice(-6);
+      }
+
+      await this.generateStreamingResponse(userText, onAudioChunk, onTextResponse);
     } catch (error) {
-      console.error(`[${this.sessionId}] Error in orchestrator:`, error);
+      console.error(`[${this.sessionId}] ❌ Processing error:`, error);
+      
+      if (onTextResponse) {
+        onTextResponse('Sorry, I encountered an error. Please try again.');
+      }
     } finally {
       this.isProcessing = false;
       latencyTracker.end(this.sessionId, 'full_pipeline');
@@ -92,143 +90,166 @@ export class StreamingOrchestrator {
   }
 
   /**
-   * Generate LLM response and stream TTS audio in real-time
-   * This uses predictive audio generation:
-   * - As LLM generates tokens, start TTS synthesis
-   * - Stream audio chunks to client immediately
-   * - Queue them for playback
+   * Generate response with ultra-fast streaming
    */
-  private async generateAndStreamResponse(
+  private async generateStreamingResponse(
     userInput: string,
     onAudioChunk: (audio: AudioFragment) => void,
     onTextResponse?: (text: string) => void
   ): Promise<void> {
-    if (!userInput.trim()) {
-      console.log(`[${this.sessionId}] ❌ Empty input, skipping`);
-      return;
-    }
-
-    latencyTracker.start(this.sessionId, 'llm_stream');
+    latencyTracker.start(this.sessionId, 'llm_generation');
 
     let fullResponse = '';
     let tokenBuffer = '';
-    let audioSent = false;
-    const minTokensForTTS = 2; // PRODUCTION: Start TTS faster (2 tokens not 5)
+    let firstTokenReceived = false;
+    let audioChunkCount = 0;
 
-    console.log(`[${this.sessionId}] 🚀 Starting LLM stream for: "${userInput}"`);
+    console.log(`[${this.sessionId}] 🧠 Starting LLM stream...`);
 
     try {
-      await llmService.streamResponse(userInput, async (token: LLMStreamToken) => {
-        if (token.token && !token.isFinal) {
-          // Accumulate tokens
-          fullResponse += token.token;
-          tokenBuffer += token.token;
+      await llmService.streamResponse(
+        userInput,
+        async (token: LLMStreamToken) => {
+          if (token.isFinal) {
+            // Process any remaining text
+            if (tokenBuffer.trim().length > 0) {
+              await this.synthesizeAndStream(
+                tokenBuffer.trim(),
+                onAudioChunk,
+                true
+              );
+              audioChunkCount++;
+            }
 
-          console.log(`[${this.sessionId}] 📝 LLM Token: "${token.token}" | Buffer: "${tokenBuffer}"`);
+            // Add to conversation history
+            this.conversationHistory.push({
+              role: 'assistant',
+              content: fullResponse,
+            });
 
-          // Trigger TTS synthesis when we have enough tokens or hit punctuation
-          const shouldSynthesize =
-            tokenBuffer.length >= minTokensForTTS ||
-            tokenBuffer.includes('.') ||
-            tokenBuffer.includes('।') ||
-            tokenBuffer.includes('?') ||
-            tokenBuffer.includes('!') ||
-            tokenBuffer.includes('\n');
+            console.log(`[${this.sessionId}] ✅ Response complete (${audioChunkCount} audio chunks)`);
+            console.log(`[${this.sessionId}] 🤖 AI: "${fullResponse}"`);
 
-          if (shouldSynthesize && tokenBuffer.trim()) {
-            await this.synthesizeAndStreamAudio(
-              tokenBuffer.trim(),
-              onAudioChunk,
-              false
-            );
-            audioSent = true;
-            tokenBuffer = ''; // Clear buffer after synthesis
-          }
-        } else if (token.isFinal) {
-          // Process any remaining tokens
-          if (tokenBuffer.trim()) {
-            await this.synthesizeAndStreamAudio(
-              tokenBuffer.trim(),
-              onAudioChunk,
-              true
-            );
-            audioSent = true;
-          } else if (!audioSent && fullResponse.trim()) {
-            // Fallback: synthesize entire response if streaming didn't work
-            await this.synthesizeAndStreamAudio(
-              fullResponse.trim(),
-              onAudioChunk,
-              true
-            );
-            audioSent = true;
+            // Fallback text
+            if (audioChunkCount === 0 && onTextResponse) {
+              onTextResponse(fullResponse);
+            }
+
+            latencyTracker.end(this.sessionId, 'llm_generation');
+            return;
           }
 
-          this.responseBuffer = fullResponse;
-          console.log(`[${this.sessionId}] ✅ LLM stream complete: "${fullResponse}"`);
+          if (token.token) {
+            // Track first token time
+            if (!firstTokenReceived) {
+              firstTokenReceived = true;
+              latencyTracker.end(this.sessionId, 'llm_first_token');
+              console.log(`[${this.sessionId}] ⚡ First token received`);
+            }
 
-          // Send text response as fallback
-          if (!audioSent && onTextResponse) {
-            console.log(`[${this.sessionId}] 📝 Sending text fallback: "${fullResponse}"`);
-            onTextResponse(fullResponse);
+            fullResponse += token.token;
+            tokenBuffer += token.token;
+
+            // Ultra-fast TTS trigger conditions
+            const shouldSynthesize =
+              tokenBuffer.length >= this.TTS_CHUNK_SIZE ||
+              this.isPunctuation(token.token) ||
+              tokenBuffer.includes('\n');
+
+            if (shouldSynthesize && tokenBuffer.trim().length > 0) {
+              const textToSynthesize = tokenBuffer.trim();
+              tokenBuffer = ''; // Clear immediately
+              
+              // Synthesize in parallel (non-blocking)
+              this.synthesizeAndStream(
+                textToSynthesize,
+                onAudioChunk,
+                false
+              ).then(() => {
+                audioChunkCount++;
+              }).catch(error => {
+                console.error(`[${this.sessionId}] TTS error:`, error);
+              });
+            }
           }
-
-          latencyTracker.end(this.sessionId, 'llm_stream');
-        }
-      });
+        },
+        this.conversationHistory // Pass conversation context
+      );
     } catch (error) {
-      console.error(`[${this.sessionId}] LLM Error:`, error);
+      console.error(`[${this.sessionId}] ❌ LLM error:`, error);
       throw error;
     }
   }
 
   /**
-   * Synthesize text to audio and stream chunks to client
+   * Synthesize text to audio and stream immediately
    */
-  private async synthesizeAndStreamAudio(
+  private async synthesizeAndStream(
     text: string,
     onAudioChunk: (audio: AudioFragment) => void,
     isFinal: boolean
   ): Promise<void> {
-    if (!text.trim()) return;
+    if (!text || text.length < 2) return;
 
-    const ttsSyncKey = `tts_${Date.now()}`;
-    latencyTracker.start(this.sessionId, ttsSyncKey);
+    const ttsKey = `tts_${Date.now()}`;
+    latencyTracker.start(this.sessionId, ttsKey);
 
     try {
-      console.log(`[${this.sessionId}] 🔊 TTS: Synthesizing "${text}" (final: ${isFinal})`);
-
+      console.log(`[${this.sessionId}] 🔊 TTS: "${text}" (final: ${isFinal})`);
+      
       // Synthesize audio
       const audioFragment = await ttsService.synthesize(text);
 
-      // Send to client immediately
+      // Stream immediately
       onAudioChunk({
         audioBuffer: audioFragment.audioBuffer,
-        timestamp: audioFragment.timestamp,
-        isFinal: isFinal,
+        timestamp: Date.now(),
+        isFinal,
       });
 
-      console.log(
-        `[${this.sessionId}] ✅ Audio sent: ${audioFragment.audioBuffer.length} bytes (final: ${isFinal})`
-      );
-
-      latencyTracker.end(this.sessionId, ttsSyncKey);
+      console.log(`[${this.sessionId}] ✅ Audio streamed: ${audioFragment.audioBuffer.length} bytes`);
+      latencyTracker.end(this.sessionId, ttsKey);
     } catch (error) {
-      console.error(`[${this.sessionId}] TTS Error for "${text}":`, error);
+      console.error(`[${this.sessionId}] ❌ TTS failed for "${text}":`, error);
+      throw error;
     }
   }
 
+  /**
+   * Check if character is punctuation
+   */
+  private isPunctuation(char: string): boolean {
+    return /[।.!?;,\n]/.test(char);
+  }
+
+  /**
+   * Get session metrics
+   */
   getSessionMetrics() {
     return {
       sessionId: this.sessionId,
-      transcriptionBuffer: this.transcriptionBuffer,
-      responseBuffer: this.responseBuffer,
+      conversationLength: this.conversationHistory.length,
       isProcessing: this.isProcessing,
       metrics: latencyTracker.getMetrics(this.sessionId),
+      lastMessages: this.conversationHistory.slice(-4),
     };
   }
 
+  /**
+   * Clear conversation history
+   */
+  clearHistory(): void {
+    this.conversationHistory = [];
+    console.log(`[${this.sessionId}] 🗑️ Conversation history cleared`);
+  }
+
+  /**
+   * Cleanup resources
+   */
   cleanup(): void {
     this.isProcessing = false;
+    this.audioQueue = [];
     latencyTracker.clear(this.sessionId);
+    console.log(`[${this.sessionId}] 🧹 Cleaned up`);
   }
 }
