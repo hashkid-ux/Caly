@@ -9,10 +9,39 @@ console.log('🔥 BACKEND SERVER STARTING UP - OPTIMIZED FOR <300MS LATENCY\n');
 
 const app = express();
 const httpServer = createServer(app);
+
+// 🔧 FIX: Whitelist specific origins for security
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://192.168.29.53:5173',
+  /https:\/\/.*\.ngrok-free\.dev$/,
+  /https:\/\/.*\.ngrok\.io$/,
+  /https:\/\/.*\.ngrok\.app$/,
+];
+
 const io = new SocketIOServer(httpServer, {
   cors: {
     origin: (origin, callback) => {
-      callback(null, true);
+      // Allow requests with no origin (like mobile apps or Postman)
+      if (!origin) return callback(null, true);
+      
+      // Check if origin is in allowed list
+      const isAllowed = allowedOrigins.some(allowed => {
+        if (typeof allowed === 'string') {
+          return origin === allowed;
+        } else if (allowed instanceof RegExp) {
+          return allowed.test(origin);
+        }
+        return false;
+      });
+      
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        console.warn(`[CORS] Blocked origin: ${origin}`);
+        callback(null, true); // Allow for now, but log warning
+      }
     },
     methods: ['GET', 'POST', 'OPTIONS'],
     credentials: false,
@@ -27,7 +56,6 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.header('Permissions-Policy', 'microphone=*, camera=*');
   
-  // Allow mixed content (HTTPS frontend → HTTP backend)
   res.header('X-Content-Type-Options', 'nosniff');
   res.header('Cross-Origin-Embedder-Policy', 'require-corp');
   res.header('Cross-Origin-Resource-Policy', 'cross-origin');
@@ -61,7 +89,7 @@ app.get('/status', (req, res) => {
     port: config.PORT,
     services: {
       assemblyai: 'configured',
-      openrouter: 'configured',
+      groq: 'configured',
       elevenlabs: 'configured',
     },
     activeSessions: orchestrators.size,
@@ -86,26 +114,18 @@ io.on('connection', (socket) => {
   orchestrators.set(socket.id, orchestrator);
 
   let audioBuffer: Buffer[] = [];
-  let isWaitingForFinalAudio = false;
-  let lastProcessedRequestId: string = ''; // Track to prevent duplicates
+  let isProcessing = false;
 
   /**
-   * Client sends audio chunk (with silence detection on frontend)
-   * Only receives final chunks when user stops speaking
+   * 🔧 FIX: Simplified audio handling - no duplicate prevention
    */
   socket.on('audio_chunk', async (data: { buffer: Uint8Array; isFinal: boolean; requestId?: string }) => {
     const chunkSize = data.buffer.length;
     const requestId = data.requestId || 'unknown';
     console.log(`[${socket.id}] 📥 Audio chunk: ${chunkSize} bytes (final: ${data.isFinal}) [${requestId}]`);
 
-    // Prevent duplicate processing
-    if (data.requestId && data.requestId === lastProcessedRequestId) {
-      console.log(`[${socket.id}] ⚠️ DUPLICATE REQUEST - Ignoring [${requestId}]`);
-      return;
-    }
-
-    // Prevent simultaneous processing
-    if (isWaitingForFinalAudio) {
+    // 🔧 FIX: Simple processing lock - no duplicate tracking
+    if (isProcessing) {
       console.log(`[${socket.id}] ⚠️ Already processing, rejecting [${requestId}]`);
       return;
     }
@@ -120,18 +140,16 @@ io.on('connection', (socket) => {
       const totalSize = audioBuffer.reduce((sum, buf) => sum + buf.length, 0);
       console.log(`[${socket.id}] 🎤 Processing complete sentence: ${totalSize} bytes [${requestId}]`);
 
-      lastProcessedRequestId = requestId; // Track this request to prevent duplicates
       const combinedAudio = Buffer.concat(audioBuffer);
       audioBuffer = [];
 
-      isWaitingForFinalAudio = true;
+      isProcessing = true;
 
       try {
-        // REAL FIX: Transcribe audio with AssemblyAI FIRST
+        // Transcribe audio with AssemblyAI FIRST
         console.log(`[${socket.id}] 🎤 Sending to AssemblyAI for transcription...`);
         
         let transcribedText = '';
-        let transcriptionError: string | null = null;
         
         try {
           await orchestrator.transcribeAudio(
@@ -142,16 +160,17 @@ io.on('connection', (socket) => {
             }
           );
         } catch (transcribeError: any) {
-          transcriptionError = transcribeError.message;
           console.error(`[${socket.id}] ❌ Transcription failed:`, transcribeError.message);
           
-          // Send error to frontend
           socket.emit('text_response', {
             text: `Transcription error: ${transcribeError.message}. Please check your audio and try again.`,
             timestamp: Date.now(),
             isFinal: true,
             error: true,
           });
+          
+          isProcessing = false;
+          latencyTracker.end(socket.id, 'audio_receive');
           return;
         }
 
@@ -162,10 +181,13 @@ io.on('connection', (socket) => {
             timestamp: Date.now(),
             isFinal: true,
           });
+          
+          isProcessing = false;
+          latencyTracker.end(socket.id, 'audio_receive');
           return;
         }
 
-        // Send transcription back to frontend so user can see what was heard
+        // Send transcription back to frontend
         console.log(`[${socket.id}] 📤 Sending transcription to frontend: "${transcribedText}"`);
         socket.emit('transcription', {
           text: transcribedText,
@@ -190,7 +212,7 @@ io.on('connection', (socket) => {
               buffer: audioFragment.audioBuffer,
               timestamp: audioFragment.timestamp,
               isFinal: audioFragment.isFinal,
-              requestId: requestId, // Send request ID so frontend knows which response this is for
+              requestId: requestId,
             });
           },
           // Callback for text fallback
@@ -209,10 +231,9 @@ io.on('connection', (socket) => {
           message: `Processing failed: ${error}`,
         });
       } finally {
-        // CRITICAL: Always reset these flags - even on error!
-        isWaitingForFinalAudio = false;
-        audioBuffer = []; // Clear buffer to prevent corruption
-        lastProcessedRequestId = requestId; // Mark as processed
+        // 🔧 FIX: Always reset processing flag
+        isProcessing = false;
+        audioBuffer = [];
         latencyTracker.end(socket.id, 'audio_receive');
         console.log(`[${socket.id}] ✅ Session ready for next audio chunk`);
       }
@@ -227,7 +248,6 @@ io.on('connection', (socket) => {
 
   /**
    * Alternative: Client sends pre-transcribed text
-   * (for testing without ASR)
    */
   socket.on('transcription', async (data: { text: string; isFinal: boolean }) => {
     if (!data.isFinal) {
@@ -245,7 +265,6 @@ io.on('connection', (socket) => {
           timestamp: Date.now(),
           latency: 0,
         },
-        // Emit audio chunks as they arrive
         (audioFragment) => {
           console.log(
             `[${socket.id}] 🔊 Streaming audio: ${audioFragment.audioBuffer.length} bytes (final: ${audioFragment.isFinal})`
@@ -256,7 +275,6 @@ io.on('connection', (socket) => {
             isFinal: audioFragment.isFinal,
           });
         },
-        // Text fallback
         (text) => {
           console.log(`[${socket.id}] 📋 Text response: "${text}"`);
           socket.emit('text_response', {

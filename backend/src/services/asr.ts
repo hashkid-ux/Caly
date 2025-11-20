@@ -4,6 +4,7 @@ import { TranscriptionResult } from '../types';
 
 export class ASRService {
   private apiKey: string;
+  private uploadCache = new Map<string, string>(); // Cache upload URLs
 
   constructor() {
     this.apiKey = config.ASSEMBLYAI_API_KEY || '';
@@ -13,33 +14,8 @@ export class ASRService {
     }
   }
 
-  async streamTranscribe(
-    audioStream: AsyncIterable<Buffer>,
-    onTranscription: (result: TranscriptionResult) => void
-  ): Promise<void> {
-    try {
-      if (!this.apiKey) {
-        throw new Error('AssemblyAI API key not set. Get free key at https://www.assemblyai.com/');
-      }
-
-      // Collect audio chunks
-      const audioChunks: Buffer[] = [];
-      for await (const chunk of audioStream) {
-        audioChunks.push(chunk);
-      }
-
-      const audioBuffer = Buffer.concat(audioChunks);
-      const uploadUrl = await this.uploadAudio(audioBuffer);
-      const transcriptId = await this.requestTranscription(uploadUrl);
-      await this.pollTranscription(transcriptId, onTranscription);
-    } catch (error) {
-      console.error('ASR Error:', error);
-      throw error;
-    }
-  }
-
   /**
-   * REAL FIX: Transcribe audio buffer directly (NEW METHOD)
+   * Enhanced transcription with better audio validation
    */
   async transcribeBuffer(
     audioBuffer: Buffer,
@@ -47,158 +23,268 @@ export class ASRService {
   ): Promise<void> {
     try {
       if (!this.apiKey) {
-        throw new Error('AssemblyAI API key not set. Get free key at https://www.assemblyai.com/');
+        throw new Error('AssemblyAI API key not configured');
       }
 
-      console.log(`[ASR] Uploading ${audioBuffer.length} bytes...`);
-      const uploadUrl = await this.uploadAudio(audioBuffer);
+      // Validate buffer size
+      if (audioBuffer.length < 5000) {
+        console.warn(`[ASR] ⚠️ Buffer too small (${audioBuffer.length} bytes) - likely not valid audio`);
+        throw new Error('Audio buffer too small to transcribe');
+      }
+
+      // Detect and validate format
+      const audioInfo = this.detectAudioFormat(audioBuffer);
+      if (!audioInfo.isValid) {
+        console.error(`[ASR] ❌ Invalid audio format detected`);
+        throw new Error('Invalid audio format - cannot transcribe');
+      }
+
+      console.log(`[ASR] ✅ Valid ${audioInfo.format} detected (${audioBuffer.length} bytes)`);
+
+      // Upload audio
+      const uploadUrl = await this.uploadAudio(audioBuffer, audioInfo.mimeType);
       
-      console.log(`[ASR] Requesting transcription...`);
+      // Request transcription
       const transcriptId = await this.requestTranscription(uploadUrl);
       
-      console.log(`[ASR] Polling for results...`);
+      // Poll for results with optimized timing
       await this.pollTranscription(transcriptId, onTranscription);
     } catch (error) {
-      console.error('ASR Buffer Transcription Error:', error);
+      console.error('[ASR] Transcription Error:', error);
       throw error;
     }
   }
 
   /**
-   * REAL FIX: Detect audio format and handle properly
+   * Enhanced format detection with validation
    */
-  private detectAudioFormat(buffer: Buffer): { mimeType: string; extension: string } {
-    if (buffer.length < 4) {
-      console.warn(`[ASR] ⚠️ Buffer too small (${buffer.length} bytes) - might not be audio!`);
+  private detectAudioFormat(buffer: Buffer): { 
+    format: string; 
+    mimeType: string; 
+    isValid: boolean;
+  } {
+    if (buffer.length < 12) {
+      return { format: 'unknown', mimeType: 'audio/webm', isValid: false };
     }
 
-    // Check for WebM signature (WebM starts with 0x1A 0x45 0xDF 0xA3)
-    if (buffer.length > 4 && 
-        buffer[0] === 0x1A && buffer[1] === 0x45 && 
+    // WebM (Matroska) - 0x1A 0x45 0xDF 0xA3
+    if (buffer[0] === 0x1A && buffer[1] === 0x45 && 
         buffer[2] === 0xDF && buffer[3] === 0xA3) {
-      console.log(`[ASR] ✅ Detected: WebM (Opus codec)`);
-      return { mimeType: 'audio/webm', extension: '.webm' };
+      console.log(`[ASR] ✅ WebM/Matroska container detected`);
+      return { format: 'WebM', mimeType: 'audio/webm', isValid: true };
     }
 
-    // Check for WAV signature (RIFF....WAVE)
-    if (buffer.length > 12 && 
-        buffer[0] === 0x52 && buffer[1] === 0x49 && 
+    // WAV - "RIFF....WAVE"
+    if (buffer[0] === 0x52 && buffer[1] === 0x49 && 
         buffer[2] === 0x46 && buffer[3] === 0x46 &&
         buffer[8] === 0x57 && buffer[9] === 0x41 && 
         buffer[10] === 0x56 && buffer[11] === 0x45) {
-      console.log(`[ASR] ✅ Detected: WAV`);
-      return { mimeType: 'audio/wav', extension: '.wav' };
+      console.log(`[ASR] ✅ WAV (RIFF) detected`);
+      return { format: 'WAV', mimeType: 'audio/wav', isValid: true };
     }
 
-    // Check for MP3 signature (FF FB or FF FA)
-    if (buffer.length > 2 && buffer[0] === 0xFF && (buffer[1] === 0xFB || buffer[1] === 0xFA)) {
-      console.log(`[ASR] ✅ Detected: MP3`);
-      return { mimeType: 'audio/mp3', extension: '.mp3' };
+    // MP3 - 0xFF 0xFB or 0xFF 0xFA (MPEG Layer 3)
+    if (buffer[0] === 0xFF && (buffer[1] === 0xFB || buffer[1] === 0xFA)) {
+      console.log(`[ASR] ✅ MP3 (MPEG) detected`);
+      return { format: 'MP3', mimeType: 'audio/mpeg', isValid: true };
     }
 
-    // Check for OGG signature
-    if (buffer.length > 3 && buffer[0] === 0x4F && buffer[1] === 0x67 && buffer[2] === 0x67) {
-      console.log(`[ASR] ✅ Detected: OGG`);
-      return { mimeType: 'audio/ogg', extension: '.ogg' };
+    // OGG - "OggS"
+    if (buffer[0] === 0x4F && buffer[1] === 0x67 && 
+        buffer[2] === 0x67 && buffer[3] === 0x53) {
+      console.log(`[ASR] ✅ OGG container detected`);
+      return { format: 'OGG', mimeType: 'audio/ogg', isValid: true };
     }
 
-    // If no signature detected, log first bytes for debugging
-    const hexBytes = Array.from(buffer.slice(0, 8)).map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`).join(' ');
-    console.warn(`[ASR] ⚠️ Unknown format - first bytes: ${hexBytes}`);
-    return { mimeType: 'audio/webm', extension: '.webm' };
-  }
+    // M4A/AAC - "ftyp"
+    if (buffer[4] === 0x66 && buffer[5] === 0x74 && 
+        buffer[6] === 0x79 && buffer[7] === 0x70) {
+      console.log(`[ASR] ✅ M4A/AAC (MP4) detected`);
+      return { format: 'M4A', mimeType: 'audio/mp4', isValid: true };
+    }
 
-  private async uploadAudio(audioBuffer: Buffer): Promise<string> {
-    const { mimeType } = this.detectAudioFormat(audioBuffer);
+    // Unknown format
+    const hexBytes = Array.from(buffer.slice(0, 16))
+      .map(b => `0x${b.toString(16).toUpperCase().padStart(2, '0')}`)
+      .join(' ');
+    console.error(`[ASR] ❌ INVALID AUDIO - First bytes: ${hexBytes}`);
     
-    console.log(`[ASR] 📤 Uploading ${audioBuffer.length} bytes as ${mimeType}...`);
-    const response = await axios.post(
-      'https://api.assemblyai.com/v2/upload',
-      audioBuffer,
-      {
-        headers: {
-          'Authorization': this.apiKey,
-          'Content-Type': mimeType,
-        },
-      }
-    );
-    return response.data.upload_url;
+    return { format: 'unknown', mimeType: 'audio/webm', isValid: false };
   }
 
+  /**
+   * Upload audio with retry logic
+   */
+  private async uploadAudio(
+    audioBuffer: Buffer, 
+    mimeType: string,
+    retries = 3
+  ): Promise<string> {
+    for (let attempt = 1; attempt <= retries; attempt++) {
+      try {
+        console.log(`[ASR] 📤 Upload attempt ${attempt}/${retries}: ${audioBuffer.length} bytes as ${mimeType}`);
+        
+        const response = await axios.post(
+          'https://api.assemblyai.com/v2/upload',
+          audioBuffer,
+          {
+            headers: {
+              'Authorization': this.apiKey,
+              'Content-Type': mimeType,
+            },
+            timeout: 15000, // 15s timeout
+          }
+        );
+
+        if (!response.data?.upload_url) {
+          throw new Error('No upload URL returned');
+        }
+
+        console.log(`[ASR] ✅ Upload successful: ${response.data.upload_url.substring(0, 60)}...`);
+        return response.data.upload_url;
+      } catch (error: any) {
+        console.error(`[ASR] ❌ Upload attempt ${attempt} failed:`, error.message);
+        
+        if (attempt === retries) {
+          throw new Error(`Upload failed after ${retries} attempts: ${error.message}`);
+        }
+        
+        // Wait before retry (exponential backoff)
+        await new Promise(resolve => setTimeout(resolve, 1000 * attempt));
+      }
+    }
+
+    throw new Error('Upload failed');
+  }
+
+  /**
+   * Request transcription with Hindi language
+   */
   private async requestTranscription(audioUrl: string): Promise<string> {
-    console.log(`[ASR] 📝 Submitting to AssemblyAI: ${audioUrl}`);
-    const response = await axios.post(
-      'https://api.assemblyai.com/v2/transcript',
-      {
-        audio_url: audioUrl,
-        language_code: 'hi',
-      },
-      {
-        headers: {
-          'Authorization': this.apiKey,
+    console.log(`[ASR] 📝 Requesting Hindi transcription...`);
+    
+    try {
+      const response = await axios.post(
+        'https://api.assemblyai.com/v2/transcript',
+        {
+          audio_url: audioUrl,
+          language_code: 'hi', // Hindi
+          speech_model: 'best', // Use best model for accuracy
+          punctuate: true,
+          format_text: true,
         },
+        {
+          headers: {
+            'Authorization': this.apiKey,
+            'Content-Type': 'application/json',
+          },
+          timeout: 10000,
+        }
+      );
+
+      if (!response.data?.id) {
+        throw new Error(`Invalid response: ${JSON.stringify(response.data)}`);
       }
-    );
-    
-    if (!response.data.id) {
-      throw new Error(`No transcript ID returned: ${JSON.stringify(response.data)}`);
+
+      console.log(`[ASR] ✅ Transcript queued: ${response.data.id}`);
+      return response.data.id;
+    } catch (error: any) {
+      console.error(`[ASR] ❌ Request failed:`, error.message);
+      throw new Error(`Transcription request failed: ${error.message}`);
     }
-    
-    console.log(`[ASR] ✅ Transcript ID: ${response.data.id}`);
-    return response.data.id;
   }
 
+  /**
+   * Poll for transcription with optimized timing
+   */
   private async pollTranscription(
     transcriptId: string,
     onTranscription: (result: TranscriptionResult) => void
   ): Promise<void> {
-    const maxAttempts = 20; // 20 attempts max
+    const maxAttempts = 30; // 30 seconds max
+    const pollInterval = 500; // Check every 500ms (faster)
     let attempts = 0;
 
     while (attempts < maxAttempts) {
+      attempts++;
+      
       try {
         const response = await axios.get(
           `https://api.assemblyai.com/v2/transcript/${transcriptId}`,
           {
-            headers: {
-              'Authorization': this.apiKey,
-            },
+            headers: { 'Authorization': this.apiKey },
+            timeout: 5000,
           }
         );
 
-        console.log(`[ASR] 🔄 Attempt ${attempts + 1}/${maxAttempts}: ${response.data.status}`)
+        const { status, text, error } = response.data;
 
-        if (response.data.status === 'completed') {
-          const transcribedText = response.data.text || '';
-          console.log(`[ASR] ✅ SUCCESS (${attempts + 1}s): "${transcribedText.substring(0, 60)}..."`);
+        // Success
+        if (status === 'completed') {
+          const transcribedText = (text || '').trim();
+          console.log(`[ASR] ✅ SUCCESS (${(attempts * pollInterval / 1000).toFixed(1)}s): "${transcribedText.substring(0, 100)}${transcribedText.length > 100 ? '...' : ''}"`);
           
           onTranscription({
             text: transcribedText,
             isFinal: true,
             timestamp: Date.now(),
-            latency: 0,
+            latency: attempts * pollInterval,
           });
           return;
-        } 
-        
-        if (response.data.status === 'error') {
-          // ⚡ INSTANT FAIL on API error - don't retry
-          const error = response.data.error || 'Unknown error';
-          console.error(`[ASR] ⚡ API ERROR (FAIL FAST): ${error}`);
-          throw new Error(`AssemblyAI API error: ${error}`);
         }
 
-        // Still processing - wait and retry
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        attempts++;
+        // Error
+        if (status === 'error') {
+          const errorMsg = error || 'Unknown transcription error';
+          console.error(`[ASR] ❌ Transcription error: ${errorMsg}`);
+          throw new Error(`AssemblyAI error: ${errorMsg}`);
+        }
+
+        // Still processing
+        if (attempts % 4 === 0) { // Log every 2 seconds
+          console.log(`[ASR] ⏳ Processing... (${(attempts * pollInterval / 1000).toFixed(1)}s)`);
+        }
+
+        // Wait before next poll
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
       } catch (error: any) {
-        // Any error = throw immediately (no retry logic)
-        console.error(`[ASR] 🛑 STOPPING: ${error.message}`);
-        throw error;
+        if (error.message.includes('AssemblyAI error')) {
+          throw error; // Don't retry on API errors
+        }
+        
+        console.error(`[ASR] ❌ Poll error:`, error.message);
+        
+        if (attempts >= maxAttempts) {
+          throw new Error('Polling timeout - transcription took too long');
+        }
+        
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
       }
     }
 
-    throw new Error(`Timeout: No response after 20 seconds`);
+    throw new Error(`Timeout: No response after ${maxAttempts * pollInterval / 1000}s`);
+  }
+
+  /**
+   * Stream transcription (for real-time use cases)
+   */
+  async streamTranscribe(
+    audioStream: AsyncIterable<Buffer>,
+    onTranscription: (result: TranscriptionResult) => void
+  ): Promise<void> {
+    try {
+      // Collect stream into buffer
+      const audioChunks: Buffer[] = [];
+      for await (const chunk of audioStream) {
+        audioChunks.push(chunk);
+      }
+
+      const audioBuffer = Buffer.concat(audioChunks);
+      await this.transcribeBuffer(audioBuffer, onTranscription);
+    } catch (error) {
+      console.error('[ASR] Stream Error:', error);
+      throw error;
+    }
   }
 }
 

@@ -7,8 +7,10 @@ export class TTSService {
   private voiceId: string;
   private requestQueue: Array<() => Promise<void>> = [];
   private isProcessing = false;
-  private maxConcurrent = 1; // ElevenLabs free tier: 1 concurrent request
+  private maxConcurrent = 1;
   private activeRequests = 0;
+  private lastRequestTime = 0;
+  private MIN_REQUEST_INTERVAL_MS = 600; // 🔧 FIX: 600ms between requests to avoid rate limits
 
   constructor() {
     this.apiKey = config.ELEVENLABS_API_KEY || '';
@@ -29,11 +31,22 @@ export class TTSService {
         try {
           this.activeRequests++;
           
-          // Retry logic for rate limiting
-          let retries = 3;
+          // 🔧 FIX: Enforce minimum interval between requests
+          const now = Date.now();
+          const timeSinceLastRequest = now - this.lastRequestTime;
+          if (timeSinceLastRequest < this.MIN_REQUEST_INTERVAL_MS) {
+            const waitTime = this.MIN_REQUEST_INTERVAL_MS - timeSinceLastRequest;
+            console.log(`[TTS] ⏳ Rate limit protection: waiting ${waitTime}ms`);
+            await new Promise(r => setTimeout(r, waitTime));
+          }
+          
+          this.lastRequestTime = Date.now();
+          
+          // 🔧 FIX: Reduced retry attempts, faster backoff
+          let retries = 2; // Only 2 retries instead of 3
           let lastError: any;
           
-          while (retries > 0) {
+          while (retries >= 0) {
             try {
               const response = await axios.post(
                 `https://api.elevenlabs.io/v1/text-to-speech/${this.voiceId}`,
@@ -51,7 +64,7 @@ export class TTSService {
                     'Content-Type': 'application/json',
                   },
                   responseType: 'arraybuffer',
-                  timeout: 30000,
+                  timeout: 15000, // 15 second timeout
                 }
               );
 
@@ -67,20 +80,22 @@ export class TTSService {
               // If rate limited (429), wait and retry
               if (error.response?.status === 429) {
                 retries--;
-                if (retries > 0) {
-                  const waitTime = Math.pow(2, 4 - retries) * 1000; // 2s, 4s, 8s
-                  console.warn(`⏳ Rate limited. Retrying in ${waitTime}ms... (${retries} retries left)`);
+                if (retries >= 0) {
+                  const waitTime = 1000 * (3 - retries); // 1s, 2s
+                  console.warn(`[TTS] ⏳ Rate limited. Retrying in ${waitTime}ms... (${retries} retries left)`);
                   await new Promise(r => setTimeout(r, waitTime));
                   continue;
                 }
               }
               
+              // For other errors, fail immediately
               throw error;
             }
           }
           
           throw lastError;
-        } catch (error) {
+        } catch (error: any) {
+          console.error(`[TTS] ❌ Failed to synthesize: "${text}"`, error.message);
           reject(error);
         } finally {
           this.activeRequests--;
@@ -118,7 +133,6 @@ export class TTSService {
   }
 
   async synthesizeWithProsody(text: string, intensity: 'low' | 'medium' | 'high' = 'medium'): Promise<AudioFragment> {
-    // Map intensity to stability settings for ElevenLabs
     const stabilityMap = {
       low: 0.3,
       medium: 0.5,

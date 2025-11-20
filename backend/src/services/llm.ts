@@ -27,16 +27,30 @@ export class LLMService {
   ): Promise<string> {
     console.log(`[LLM] Starting stream for: "${userMessage}"`);
     
+    // 🔧 FIX: Include conversation history!
     const messages: OpenRouterMessage[] = [
       {
         role: 'system',
         content: config.SYSTEM_PROMPT,
       },
-      {
-        role: 'user',
-        content: userMessage,
-      },
     ];
+
+    // 🔧 FIX: Add conversation history if provided
+    if (conversationHistory && conversationHistory.length > 0) {
+      console.log(`[LLM] Adding ${conversationHistory.length} messages from history`);
+      conversationHistory.forEach(msg => {
+        messages.push({
+          role: msg.role,
+          content: msg.content
+        });
+      });
+    }
+
+    // Add current user message
+    messages.push({
+      role: 'user',
+      content: userMessage,
+    });
 
     const payload = {
       model: this.model,
@@ -48,6 +62,8 @@ export class LLMService {
 
     try {
       console.log(`[LLM] Calling Groq API with model: ${this.model}`);
+      console.log(`[LLM] Total messages in context: ${messages.length}`);
+      
       const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method: 'POST',
         headers: {
@@ -103,7 +119,6 @@ export class LLMService {
               if (token) {
                 tokenCount++;
                 fullResponse += token;
-                console.log(`[LLM] Token #${tokenCount}: "${token}"`);
                 onToken({
                   token,
                   isFinal: false,
